@@ -4,7 +4,7 @@
 
 ## 当前写者
 
-- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.1 两个防护已发布**；trusted publishing 未匹配，待查）
+- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.2（同秒并列两个修复）已发布**；trusted publishing 待查）
 - 分支：main
 - 开始时间：—
 - 本轮：① 新增两个防护（都是 1.0.0 发布后实测出来的）：**`DEST` 不许落在工作区里**（会自我繁殖：
@@ -92,8 +92,10 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
   把「同一秒」从时序巧合变成**常态**。修复前它稳定红 2~7 项；修复后连续 3 轮全绿。
   已接进 CI（两个平台各跑一遍）。
 - **测试侧**：自测里所有「按名取最新」改成按 HEAD 的 sha（第 7、11、14 节）。
-- **版本 1.0.2 已 bump，但还没发布**：npm 侧 trusted publishing 仍未匹配（见「未决问题」），
-  要发得先修它、或用本机 token 发（无 provenance）。
+- **1.0.2 已发布**：仍走本机 `npm publish`（**无 provenance**，trusted publishing 未匹配，见「未决问题」）。
+  `dist-tags.latest = 1.0.2`，registry `dist.shasum` `c6be5421f114e0ca2a9b265ec49ed0a84a7e2a30`；
+  Release asset 已按老规矩对齐成 registry 那一份（sha256 `b9d862e402ca457ba49c1c7e6922e9e097aecd8fffd12254bb9c20526c92b9e2`）。
+  这一版的 Release 触发的 CI 发布**正确地跳过**了（日志：`dev-backup@1.0.2 is already on the registry`）。
 
 **2026-10-02 追加（1.0.1 之后）：CI 上修掉一个「按时序翻车」的用例**
 
