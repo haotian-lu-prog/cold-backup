@@ -1,6 +1,6 @@
 {
   "name": "cold-backup",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Cold backup for a dev workspace: git bundles, directory snapshots and config whitelists into any folder your cloud client already syncs. Zero dependencies, bash 3.2+, macOS and Linux (工作区冷备 CLI)",
   "bin": {
     "cold-backup": "bin/cold-backup"
