@@ -86,7 +86,7 @@ Precedence: **flags > environment > config file > defaults**. The config file is
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `ROOT` | `DEV_ROOT` | `~/dev` | workspace root to back up |
-| `DEST` | `DEV_BACKUP_DEST` | none (**required**) | where artifacts go |
+| `DEST` | `DEV_BACKUP_DEST` | none (**required**) | where artifacts go. **Must be outside `ROOT`** — inside it, snapshots would swallow the backup itself and grow every run, so the tool refuses |
 | `LOGDIR` | `DEV_BACKUP_LOGDIR` | macOS `~/Library/Logs/dev-backup`; else `~/.local/state/dev-backup` | logs, lock, `last-ok`, `last-failure` |
 | `DEPTH` | `DEV_BACKUP_DEPTH` | `3` | how deep to look for `.git` under ROOT |
 | `KEEP` | `DEV_BACKUP_KEEP` | `10` | artifacts kept per target; older ones rotate out |

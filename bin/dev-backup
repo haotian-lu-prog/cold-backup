@@ -33,7 +33,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 2
 fi
 
-VERSION="1.0.0"
+VERSION="1.0.1"
 SCHEMA="dev-backup.status/1"
 PROG="${DEV_BACKUP_PROG:-$(basename "$0")}"
 SELF="$0"
@@ -193,6 +193,29 @@ expand_path() { # 展开 ~ 与前缀 $HOME；配置/环境变量里写字面量�
     '${HOME}'*) p="$HOME${p#\$\{HOME\}}" ;;
   esac
   printf '%s' "$p"
+}
+
+# 把「可能还不存在」的路径尽量规范化：存在的走 pwd -P（穿透 /tmp → /private/tmp 这类软链），
+# 不存在的用「规范化后的父目录 + 名字」。两条路径必须同一套口径，前缀比较才有意义。
+canon_path() {
+  local p="$1" parent base
+  [ -n "$p" ] || return 0
+  if [ -d "$p" ]; then ( cd "$p" 2>/dev/null && pwd -P ); return 0; fi
+  parent="$(dirname "$p")"; base="$(basename "$p")"
+  if [ -d "$parent" ]; then printf '%s/%s' "$( cd "$parent" && pwd -P )" "$base"
+  else printf '%s' "$p"; fi
+}
+
+# 备份目标是否落在工作区根里面（相等也算：DEST == ROOT 时快照会把整棵工作区打进去）。
+dest_inside_root() {
+  local root_c dest_c
+  root_c="$(canon_path "$DEV_ROOT")"
+  dest_c="$(canon_path "$DEST")"
+  [ -n "$root_c" ] && [ -n "$dest_c" ] || return 1
+  case "$dest_c" in
+    "$root_c"|"$root_c"/*) return 0 ;;
+  esac
+  return 1
 }
 
 # 解析一项：命令行 > 环境变量 > 配置文件（短名或全名） > 默认
@@ -703,6 +726,12 @@ run_backup() {
   if [ ! -d "$DEV_ROOT" ]; then die "工作区根不存在：$DEV_ROOT"; fi
   if [ ! -d "$(dirname "$DEST")" ]; then
     die "备份目标的上级目录不存在：$(dirname "$DEST")（同步客户端没装/没登录？或路径写错了）"
+  fi
+  # 备份目标不能在工作区里：那样「非 git 顶层目录打快照」会把**上一轮的产物**打进去，
+  # 每跑一轮快照就大一圈（实测：3 轮 3194 → 6945 → 14110 字节，逐轮翻倍）。
+  # 这不是可以「提醒一下」的配置，是会让备份自我繁殖的配置 —— 直接拒绝。
+  if dest_inside_root; then
+    die "备份目标就在工作区里：${DEST}（工作区根 ${DEV_ROOT}）。快照会把备份自己逐轮打大，请把 DEST 移到工作区外"
   fi
   # macOS 隐私保护：后台任务读不到 FileProvider 域里**已有**的文件（EPERM），
   # 症状是「看不到任何产物、写入失败」。先把话说清楚，别让人以为是备份逻辑坏了。
@@ -1384,6 +1413,13 @@ sched_install() {
   local kind="${SCHED_KIND:-launchd}"
   if [ -z "$SCHED_KIND" ]; then [ "$IS_DARWIN" = "1" ] && kind="launchd" || kind="cron"; fi
   mkdir -p "$LOG_DIR" 2>/dev/null
+  # 任务每天调用的是 --program（默认就是本 CLI）。指向一个跑不起来的路径 = 每天静默失败，
+  # 而「每日任务没跑」正是这个工具要回答的问题 —— 装的时候就说清楚，别等它红。
+  local prog; prog="$(sched_program)"
+  if [ ! -x "$prog" ]; then
+    out "  ! --program 指向的不是可执行文件：${prog}"
+    out "    任务每天会调用它一次，现在这一步会直接失败（装完记得让它可执行）"
+  fi
   if [ "$kind" = "launchd" ]; then
     local plist; plist="$(launchd_plist_path)"
     if [ "$DRY_RUN" = "1" ]; then

@@ -46,6 +46,10 @@ dev-backup schedule install --program /Applications/MyBackup.app/Contents/MacOS/
 
 程序会被调用成 `<program> --daily --trigger=launchd`。
 
+装的时候会检查这个路径**是不是可执行文件**：不是就当场警告（任务每天都会调用它，
+指向一个跑不起来的路径 = 每天静默失败，而「每日任务到底跑没跑」正是这个工具要回答的问题）。
+`--dry-run` 同样会检查并打印警告。
+
 ## macOS 的 TCC 坑（重要）
 
 如果 `DEST` 在 `~/Library/CloudStorage/`（OneDrive、Google Drive、Dropbox 的新版客户端）

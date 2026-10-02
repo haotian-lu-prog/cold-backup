@@ -710,6 +710,45 @@ else
   chmod 644 "$FDA_DEST/manifests/20260101T000000Z-daily.tsv"
 fi
 
+hdr "25 防护：备份目标不能在 工作区里 / --program 必须可执行"
+# 25a DEST 在工作区里 → 直接拒绝，且不许产生任何产物。
+# 为什么是错误而不是提醒：非 git 顶层目录的快照会把**上一轮的产物**打进去，逐轮翻倍
+# （实测 3 轮 3194 → 6945 → 14110 字节），这是会让备份自我繁殖的配置。
+inside="$DEV_ROOT/inside-dest"
+mkdir -p "$inside"
+out="$(DEV_BACKUP_DEST="$inside" "$BIN" --trigger=selftest 2>&1)"; rc=$?
+eq "① DEST 在工作区里时备份退出码" "$rc" "1"
+contains "$out" '工作区里' && ok "① 报错点明了「备份目标就在工作区里」" || no "① 报错没说清原因：${out}"
+eq "① 被拒时没写出任何产物" "$(ls -1 "$inside" 2>/dev/null | wc -l | tr -d ' ')" "0"
+
+# 25b DEST == ROOT 同样拒绝（等于把整棵工作区当目标）
+DEV_BACKUP_DEST="$DEV_ROOT" "$BIN" --trigger=selftest >/dev/null 2>&1
+eq "② DEST == ROOT 时备份退出码" "$?" "1"
+
+# 25c 正常配置（DEST 在工作区外）不受影响
+outside="$W/outside-dest"; mkdir -p "$outside"
+DEV_BACKUP_DEST="$outside" "$BIN" --trigger=selftest >/dev/null 2>&1
+eq "③ DEST 在工作区外时备份退出码" "$?" "0"
+[ -d "$outside/repos" ] && ok "③ 正常产生产物" || no "③ 没产生产物"
+
+# 25d --program 指向跑不起来的东西：dry-run 也要给警告（任务会每天静默失败，
+# 而「每日任务到底跑没跑」正是这个工具要回答的问题）
+LABEL_PROBE="com.dev-backup.probe.$$"
+out="$(DEV_BACKUP_DEST="$outside" "$BIN" schedule install --dry-run --kind launchd \
+  --label "$LABEL_PROBE" --program "$W/does-not-exist" 2>&1)"; rc=$?
+eq "④ --program 不存在时 dry-run 退出码" "$rc" "0"
+contains "$out" '不是可执行文件' && ok "④ 给出了「--program 不是可执行文件」警告" \
+  || no "④ 没有警告：装出来的任务会每天静默失败"
+
+# 25e --program 指向真实可执行文件：不许误报
+printf '#!/usr/bin/env bash\nexit 0\n' >"$W/real-prog"; chmod +x "$W/real-prog"
+out="$(DEV_BACKUP_DEST="$outside" "$BIN" schedule install --dry-run --kind launchd \
+  --label "$LABEL_PROBE" --program "$W/real-prog" 2>&1)"
+case "$out" in
+  *不是可执行文件*) no "⑤ 可执行文件被误报为不可执行" ;;
+  *) ok "⑤ 可执行文件不误报" ;;
+esac
+
 printf '\n== 自测结果：%d 项通过，%d 项失败，%d 项跳过\n' "$pass" "$fail" "$skipped"
 printf '   （临时目录已清理：%s）\n' "$W"
 [ "$fail" -eq 0 ] || exit 1

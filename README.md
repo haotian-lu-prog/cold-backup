@@ -79,7 +79,7 @@ dev-backup schedule install       # 5) 装每日任务（macOS: launchd；其他
 | 配置文件键 | 环境变量 | 默认 | 说明 |
 |---|---|---|---|
 | `ROOT` | `DEV_ROOT` | `~/dev` | 要备份的工作区根 |
-| `DEST` | `DEV_BACKUP_DEST` | 无（**必填**） | 备份目标目录 |
+| `DEST` | `DEV_BACKUP_DEST` | 无（**必填**） | 备份目标目录。**必须在 `ROOT` 之外** —— 放在工作区里会让快照把备份自己逐轮打大，工具会直接拒绝 |
 | `LOGDIR` | `DEV_BACKUP_LOGDIR` | macOS `~/Library/Logs/dev-backup`；其他 `~/.local/state/dev-backup` | 日志、锁、`last-ok` / `last-failure` |
 | `DEPTH` | `DEV_BACKUP_DEPTH` | `3` | 从 ROOT 往下找 `.git` 的层数 |
 | `KEEP` | `DEV_BACKUP_KEEP` | `10` | 每个目标保留多少份产物，更旧的轮转删除 |
