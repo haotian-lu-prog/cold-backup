@@ -24,7 +24,7 @@ jobs:
       - name: 语法检查
         run: |
           set -e
-          bash -n bin/dev-backup
+          bash -n bin/cold-backup
           bash -n install.sh
           bash -n test/lint.sh
           bash -n test/selftest.sh
@@ -32,7 +32,7 @@ jobs:
 
       - name: macOS 上再用系统 bash 3.2 检查一遍
         if: runner.os == 'macOS'
-        run: /bin/bash -n bin/dev-backup
+        run: /bin/bash -n bin/cold-backup
 
       - name: 静态检查（跨平台陷阱 / 契约一致性 / 无个人路径）
         run: bash test/lint.sh

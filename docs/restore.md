@@ -56,9 +56,9 @@ mkdir -p /tmp/restore && tar -xzf "<DEST>/snapshots/<标签>/<文件>.tar.gz" -C
 ## 4. 验证：别等真要还原时才发现坏了
 
 ```sh
-dev-backup --verify            # 逐份校验：最新那份真 clone + fsck，其余至少验结构
-dev-backup --verify --fix      # 顺手删掉确认损坏的产物（仍返回 1：发现问题这件事不抹掉）
-dev-backup --restore-drill     # 真演练：镜像 clone 每个最新 bundle，比对提交数与 ref 指纹
+cold-backup --verify            # 逐份校验：最新那份真 clone + fsck，其余至少验结构
+cold-backup --verify --fix      # 顺手删掉确认损坏的产物（仍返回 1：发现问题这件事不抹掉）
+cold-backup --restore-drill     # 真演练：镜像 clone 每个最新 bundle，比对提交数与 ref 指纹
 ```
 
 `--restore-drill` 是**唯一**能证明「这套备份真能还原」的东西：它把产物当远端 clone 出来，
@@ -74,7 +74,7 @@ column -t -s $'\t' "<DEST>/manifests/20261002T103000Z-post-commit.tsv"
 ## 5. 云盘那一份坏了怎么办
 
 - **单份产物损坏**（同步中断、磁盘错误）：`--verify` 会指出来，`--verify --fix` 删掉它，
-  再跑一次 `dev-backup` 重建最新那份。历史产物坏了就只能删 —— 它们本来也是轮转要淘汰的。
+  再跑一次 `cold-backup` 重建最新那份。历史产物坏了就只能删 —— 它们本来也是轮转要淘汰的。
 - **`.sha256` 缺失或不符**：按「不可信」处理（不是「通过」）。重跑备份会重建并补回指纹。
 - **整个目录空了**：先确认不是权限问题 —— macOS 上 `--status` 会报 `fda-blocked`，那是
   「读不到」，不是「没有了」。别在没授权的情况下跑 `--verify --fix`，那会把好产物误判成损坏。
@@ -95,11 +95,11 @@ column -t -s $'\t' "<DEST>/manifests/20261002T103000Z-post-commit.tsv"
 
 ## 7. 换机器怎么开工
 
-1. 装：`npm i -g dev-backup`（或 `./install.sh`）。
-2. 写配置：`dev-backup --init` 后填 `ROOT` 与 `DEST`（新机器上的路径可以完全不同）。
-3. 看：`dev-backup --status` —— 如果 `DEST` 是同一个同步目录，它应该直接认得那些产物。
-4. 验：`dev-backup --restore-drill` 走一遍，确认能还原。
-5. 装定时任务：`dev-backup schedule install`。
+1. 装：`npm i -g cold-backup`（或 `./install.sh`）。
+2. 写配置：`cold-backup --init` 后填 `ROOT` 与 `DEST`（新机器上的路径可以完全不同）。
+3. 看：`cold-backup --status` —— 如果 `DEST` 是同一个同步目录，它应该直接认得那些产物。
+4. 验：`cold-backup --restore-drill` 走一遍，确认能还原。
+5. 装定时任务：`cold-backup schedule install`。
 
 注意 `WORKSPACE_ID`（归属标记）默认含**主机名**：新机器是新的工作区身份，两边指向同一个
 `DEST` 时不会互相删产物。若你就是要两边共享同一批产物，把两台机器的 `WORKSPACE_ID` 设成

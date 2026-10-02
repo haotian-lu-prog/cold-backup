@@ -1,10 +1,10 @@
-English | [简体中文](https://github.com/haotian-lu-prog/dev-backup/blob/main/README.md)
+English | [简体中文](https://github.com/haotian-lu-prog/cold-backup/blob/main/README.md)
 
-# dev-backup
+# cold-backup
 
-[![npm version](https://img.shields.io/npm/v/dev-backup)](https://www.npmjs.com/package/dev-backup)
-[![license](https://img.shields.io/npm/l/dev-backup)](LICENSE)
-[![CI](https://github.com/haotian-lu-prog/dev-backup/actions/workflows/ci.yml/badge.svg)](https://github.com/haotian-lu-prog/dev-backup/actions/workflows/ci.yml)
+[![npm version](https://img.shields.io/npm/v/cold-backup)](https://www.npmjs.com/package/cold-backup)
+[![license](https://img.shields.io/npm/l/cold-backup)](LICENSE)
+[![CI](https://github.com/haotian-lu-prog/cold-backup/actions/workflows/ci.yml/badge.svg)](https://github.com/haotian-lu-prog/cold-backup/actions/workflows/ci.yml)
 
 **Cold backup for a workspace full of git repositories.** Artifacts are written straight into a
 folder you already sync (OneDrive, iCloud Drive, Dropbox, …) or onto any external disk — your
@@ -14,10 +14,10 @@ It is not rclone and not restic, and it does not encrypt. It does one thing: tur
 into a pile of **immutable, verifiable, fully restorable files**.
 
 ```sh
-npm i -g dev-backup      # or ./install.sh (no Node required)
-dev-backup --init        # write a config template
-dev-backup --status      # did it run? did it upload?
-dev-backup               # take a backup
+npm i -g cold-backup      # or ./install.sh (no Node required)
+cold-backup --init        # write a config template
+cold-backup --status      # did it run? did it upload?
+cold-backup               # take a backup
 ```
 
 > Command output, docs and `docs/decisions.md` are Chinese-first (the author's toolchain language).
@@ -43,10 +43,10 @@ Three rules run through all of it:
 ## Install
 
 ```sh
-npm i -g dev-backup
+npm i -g cold-backup
 # or, without Node:
-git clone https://github.com/haotian-lu-prog/dev-backup.git
-cd dev-backup && ./install.sh     # installs into ~/.local/bin
+git clone https://github.com/haotian-lu-prog/cold-backup.git
+cd cold-backup && ./install.sh     # installs into ~/.local/bin
 ```
 
 Requirements: `bash` (macOS 3.2 is fine), `git`, `tar`, `gzip`, and `shasum` or `sha256sum`.
@@ -54,26 +54,26 @@ Requirements: `bash` (macOS 3.2 is fine), `git`, `tar`, `gzip`, and `shasum` or 
 ## Quick start
 
 ```sh
-dev-backup --init                      # 1) creates ~/.config/dev-backup/config
-$EDITOR ~/.config/dev-backup/config    # 2) set ROOT and DEST
-dev-backup --status                    # 3) should say "not backed up yet"
-dev-backup                             # 4) first backup
-dev-backup schedule install            # 5) daily job (launchd on macOS, cron elsewhere)
+cold-backup --init                      # 1) creates ~/.config/cold-backup/config
+$EDITOR ~/.config/cold-backup/config    # 2) set ROOT and DEST
+cold-backup --status                    # 3) should say "not backed up yet"
+cold-backup                             # 4) first backup
+cold-backup schedule install            # 5) daily job (launchd on macOS, cron elsewhere)
 ```
 
 ## Commands
 
 | Command | What it does | Exit |
 |---|---|---|
-| `dev-backup [--trigger=name]` | take a backup (idempotent) | 0 / 1 |
-| `dev-backup --status [--json]` | freshness + upload state; `--json` emits `dev-backup.status/1` | 0 / 1 |
-| `dev-backup --verify [--fix]` | verify **every** artifact (real clone + `fsck` for bundles) | 0 / 1 |
-| `dev-backup --daily` | catch-up backup + verify + status (this is what the scheduler runs) | 0 / 1 |
-| `dev-backup --prune-orphans [--apply]` | list (default) or delete leftovers that match no target | 0 / 1 |
-| `dev-backup --restore-drill [dir]` | mirror-clone every latest bundle and compare refs & commit counts | 0 / 1 |
-| `dev-backup schedule install\|uninstall\|status [--dry-run]` | manage the daily job | 0 / 1 / 2 |
-| `dev-backup --init [--force]` | write a config template | 0 / 2 |
-| `dev-backup --version` | version + active config file | 0 |
+| `cold-backup [--trigger=name]` | take a backup (idempotent) | 0 / 1 |
+| `cold-backup --status [--json]` | freshness + upload state; `--json` emits `cold-backup.status/1` | 0 / 1 |
+| `cold-backup --verify [--fix]` | verify **every** artifact (real clone + `fsck` for bundles) | 0 / 1 |
+| `cold-backup --daily` | catch-up backup + verify + status (this is what the scheduler runs) | 0 / 1 |
+| `cold-backup --prune-orphans [--apply]` | list (default) or delete leftovers that match no target | 0 / 1 |
+| `cold-backup --restore-drill [dir]` | mirror-clone every latest bundle and compare refs & commit counts | 0 / 1 |
+| `cold-backup schedule install\|uninstall\|status [--dry-run]` | manage the daily job | 0 / 1 / 2 |
+| `cold-backup --init [--force]` | write a config template | 0 / 2 |
+| `cold-backup --version` | version + active config file | 0 |
 
 `--status` and `--version` are **strictly read-only**: no directories created, no files written,
 no log rotation.
@@ -81,24 +81,24 @@ no log rotation.
 ## Configuration
 
 Precedence: **flags > environment > config file > defaults**. The config file is `KEY=VALUE` at
-`~/.config/dev-backup/config` (override with `--config` or `DEV_BACKUP_CONFIG`).
+`~/.config/cold-backup/config` (override with `--config` or `COLD_BACKUP_CONFIG`).
 
 | Key | Env | Default | Meaning |
 |---|---|---|---|
 | `ROOT` | `DEV_ROOT` | `~/dev` | workspace root to back up |
-| `DEST` | `DEV_BACKUP_DEST` | none (**required**) | where artifacts go. **Must be outside `ROOT`** — inside it, snapshots would swallow the backup itself and grow every run, so the tool refuses |
-| `LOGDIR` | `DEV_BACKUP_LOGDIR` | macOS `~/Library/Logs/dev-backup`; else `~/.local/state/dev-backup` | logs, lock, `last-ok`, `last-failure` |
-| `DEPTH` | `DEV_BACKUP_DEPTH` | `3` | how deep to look for `.git` under ROOT |
-| `KEEP` | `DEV_BACKUP_KEEP` | `10` | artifacts kept per target; older ones rotate out |
-| `SNAPSHOTS` | `DEV_BACKUP_SNAPSHOTS` | `1` | snapshot non-git top-level dirs |
-| `INCLUDE_ENV` | `DEV_BACKUP_INCLUDE_ENV` | `0` | include `.env` files in snapshots (excluded by default: plaintext secrets) |
-| `EXCLUDES` | `DEV_BACKUP_EXCLUDES` | empty | extra tar excludes, space separated |
-| `CONFIGS` | `DEV_BACKUP_CONFIGS` | `off` | config whitelist, `<label>|<home>|<rel,rel>`, `;`-separated |
-| `NO_NOTIFY` | `DEV_BACKUP_NO_NOTIFY` | `0` | `1` disables desktop notifications |
-| `UPLOAD_GRACE` | `DEV_BACKUP_UPLOAD_GRACE` | `600` | seconds before an artifact counts as "not uploaded" |
-| `WORKSPACE_ID` | `DEV_BACKUP_WORKSPACE_ID` | host + ROOT fingerprint | ownership marker (see below) |
+| `DEST` | `COLD_BACKUP_DEST` | none (**required**) | where artifacts go. **Must be outside `ROOT`** — inside it, snapshots would swallow the backup itself and grow every run, so the tool refuses |
+| `LOGDIR` | `COLD_BACKUP_LOGDIR` | macOS `~/Library/Logs/cold-backup`; else `~/.local/state/cold-backup` | logs, lock, `last-ok`, `last-failure` |
+| `DEPTH` | `COLD_BACKUP_DEPTH` | `3` | how deep to look for `.git` under ROOT |
+| `KEEP` | `COLD_BACKUP_KEEP` | `10` | artifacts kept per target; older ones rotate out |
+| `SNAPSHOTS` | `COLD_BACKUP_SNAPSHOTS` | `1` | snapshot non-git top-level dirs |
+| `INCLUDE_ENV` | `COLD_BACKUP_INCLUDE_ENV` | `0` | include `.env` files in snapshots (excluded by default: plaintext secrets) |
+| `EXCLUDES` | `COLD_BACKUP_EXCLUDES` | empty | extra tar excludes, space separated |
+| `CONFIGS` | `COLD_BACKUP_CONFIGS` | `off` | config whitelist, `<label>|<home>|<rel,rel>`, `;`-separated |
+| `NO_NOTIFY` | `COLD_BACKUP_NO_NOTIFY` | `0` | `1` disables desktop notifications |
+| `UPLOAD_GRACE` | `COLD_BACKUP_UPLOAD_GRACE` | `600` | seconds before an artifact counts as "not uploaded" |
+| `WORKSPACE_ID` | `COLD_BACKUP_WORKSPACE_ID` | host + ROOT fingerprint | ownership marker (see below) |
 
-`DEV_BACKUP_DISABLE=1` makes backup mode exit 0 immediately (git hooks use it as a kill switch).
+`COLD_BACKUP_DISABLE=1` makes backup mode exit 0 immediately (git hooks use it as a kill switch).
 
 ## Restore
 
@@ -108,7 +108,7 @@ See [`docs/restore.md`](docs/restore.md) for the full manual. The short version:
 git clone --mirror "<DEST>/repos/<label>/<file>.bundle" /tmp/restore.git   # everything
 git clone "<DEST>/repos/<label>/<file>.bundle" /tmp/restore                # working copy
 tar -xzf "<DEST>/snapshots/<label>/<file>.tar.gz" -C /tmp/restore
-dev-backup --restore-drill                                                 # prove it, don't assume it
+cold-backup --restore-drill                                                 # prove it, don't assume it
 ```
 
 **Not covered, on purpose:** uncommitted/untracked changes, hidden directories such as
@@ -119,8 +119,8 @@ committing.
 ## Scheduling
 
 ```sh
-dev-backup schedule install --at 12:00
-dev-backup schedule install --dry-run
+cold-backup schedule install --at 12:00
+cold-backup schedule install --dry-run
 ```
 
 Full details in [`docs/scheduling.md`](docs/scheduling.md), including the macOS catch: if `DEST`
@@ -130,7 +130,7 @@ point the job at an already-authorised program with `--program /path/to/program`
 
 ## Sharing one destination between machines
 
-Every target directory gets a `.dev-backup-owner` marker (a workspace ID, by default derived from
+Every target directory gets a `.cold-backup-owner` marker (a workspace ID, by default derived from
 hostname + root path). A directory owned by a *different* workspace is reported but **never**
 written to and **never** deleted — `--prune-orphans --apply` skips it and a backup run refuses it
 and exits non-zero. Set the same `WORKSPACE_ID` on both machines if you genuinely want them to
@@ -138,8 +138,8 @@ share one set of artifacts.
 
 ## For downstream consumers
 
-`dev-backup.status/1` is a stable contract consumed by
-[dsh-dev-backup](https://www.npmjs.com/package/dsh-dev-backup) (a DeepSeek Harness panel) and by a
+`cold-backup.status/1` is a stable contract consumed by
+[dsh-cold-backup](https://www.npmjs.com/package/dsh-cold-backup) (a DeepSeek Harness panel) and by a
 home-grown macOS panel. Fields, reason codes, upload tokens and exit conventions are documented in
 [`docs/compatibility.md`](docs/compatibility.md).
 

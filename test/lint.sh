@@ -4,7 +4,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
-BIN="$ROOT/bin/dev-backup"
+BIN="$ROOT/bin/cold-backup"
 PKG="$ROOT/package.json"
 DOC="$ROOT/docs/compatibility.md"
 pass=0; fail=0
@@ -16,11 +16,11 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [ -f "$BIN" ] || { printf '✗ 找不到 %s\n' "$BIN" >&2; exit 2; }
 
 hdr "1 语法"
-for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
+for f in bin/cold-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
   [ -f "$ROOT/$f" ] || { no "缺文件：$f"; continue; }
   if out="$(bash -n "$ROOT/$f" 2>&1)"; then ok "$f 语法通过"; else no "$f 语法错误：$out"; fi
 done
-[ -x "$BIN" ] && ok "bin/dev-backup 可执行位已设" || no "bin/dev-backup 缺可执行位"
+[ -x "$BIN" ] && ok "bin/cold-backup 可执行位已设" || no "bin/cold-backup 缺可执行位"
 case "$(head -1 "$BIN")" in '#!/usr/bin/env bash') ok "shebang 是 /usr/bin/env bash" ;; *) no "shebang 不对：$(head -1 "$BIN")" ;; esac
 
 hdr "2 bash 3.2 兼容（macOS 系统 bash 就是 3.2）"
@@ -45,7 +45,7 @@ multibyte_lint() { # $1=文件
 
 if have perl; then
   mb_hits=""
-  for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
+  for f in bin/cold-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
     [ -f "$ROOT/$f" ] || continue
     h="$(multibyte_lint "$ROOT/$f")"
     [ -n "$h" ] && mb_hits="${mb_hits}${h}
@@ -64,11 +64,11 @@ fi
 hdr "3 版本与契约一致性"
 ver_bin="$(sed -n 's/^VERSION="\([^"]*\)".*/\1/p' "$BIN" | head -1)"
 ver_pkg="$(sed -n 's/.*"version": "\([^"]*\)".*/\1/p' "$PKG" | head -1)"
-[ -n "$ver_bin" ] || no "bin/dev-backup 里找不到 VERSION"
+[ -n "$ver_bin" ] || no "bin/cold-backup 里找不到 VERSION"
 [ "$ver_bin" = "$ver_pkg" ] && ok "版本号一致（${ver_bin}）" || no "版本号不一致：bin=${ver_bin} package.json=${ver_pkg}"
 
 schema_bin="$(sed -n 's/^SCHEMA="\([^"]*\)".*/\1/p' "$BIN" | head -1)"
-[ "$schema_bin" = "dev-backup.status/1" ] && ok "schema 常量是 $schema_bin" || no "schema 常量异常：$schema_bin"
+[ "$schema_bin" = "cold-backup.status/1" ] && ok "schema 常量是 $schema_bin" || no "schema 常量异常：$schema_bin"
 if [ -f "$DOC" ]; then
   grep -qF "$schema_bin" "$DOC" && ok "docs/compatibility.md 写明了该契约" || no "docs/compatibility.md 里找不到 $schema_bin"
 else
@@ -78,34 +78,34 @@ fi
 hdr "4 公开包里不许出现本机私有路径"
 for pat in 'haotian' 'com\.haotianlu' '/Users/lu' 'OneDrive-Personal' '~/.claude' '~/.codex' '~/.dsh' '_shared/bin'; do
   if hits="$(grep -nE "$pat" "$BIN")"; then
-    no "bin/dev-backup 里出现私有路径/标识（${pat}）："; printf '%s\n' "$hits" | head -3
+    no "bin/cold-backup 里出现私有路径/标识（${pat}）："; printf '%s\n' "$hits" | head -3
   fi
 done
 [ "$fail" -eq 0 ] && ok "没有个人路径、个人 label、个人 home 约定" || true
 
 hdr "5 默认值必须是「不认识陌生人的 home」"
-grep -q 'CONFIGS_SPEC="\$(cfg DEV_BACKUP_CONFIGS CONFIGS "" "off")"' "$BIN" \
+grep -q 'CONFIGS_SPEC="\$(cfg COLD_BACKUP_CONFIGS CONFIGS "" "off")"' "$BIN" \
   && ok "配置白名单默认 off" || no "配置白名单默认值不是 off（公开 CLI 不许去 tar 陌生人的 home）"
-grep -q 'DEST="\$(cfg DEV_BACKUP_DEST DEST "\$OPT_DEST" "")"' "$BIN" \
+grep -q 'DEST="\$(cfg COLD_BACKUP_DEST DEST "\$OPT_DEST" "")"' "$BIN" \
   && ok "备份目标默认留空（必须显式配置）" || no "备份目标默认值不是空"
 
 hdr "6 CLI 冒烟（不写任何文件）"
 tmpconf="$ROOT/.lint-no-such-config"
-out="$(DEV_BACKUP_CONFIG="$tmpconf" "$BIN" --version 2>&1)"; rc=$?
+out="$(COLD_BACKUP_CONFIG="$tmpconf" "$BIN" --version 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "--version 退出码 0" || no "--version 退出码 $rc"
 printf '%s' "$out" | grep -qF "$ver_bin" && ok "--version 打印的版本与源码一致" || no "--version 没打印版本号：$out"
 [ -e "$tmpconf" ] && { no "--version 竟然创建了配置文件"; rm -f "$tmpconf"; } || ok "--version 没创建任何文件"
 
-out="$(DEV_BACKUP_CONFIG="$tmpconf" "$BIN" --help 2>&1)"; rc=$?
+out="$(COLD_BACKUP_CONFIG="$tmpconf" "$BIN" --help 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "--help 退出码 0" || no "--help 退出码 $rc"
 for kw in --status --verify --daily --restore-drill --init schedule; do
   printf '%s' "$out" | grep -qF -- "$kw" && ok "--help 提到 $kw" || no "--help 没提到 $kw"
 done
 
 # `--init` 的输出里曾经用过反引号包裹命令名，结果被 shell 当命令替换执行
-# （`bin/dev-backup: line N: dev-backup: command not found`）。用 stderr 干净与否兜住这类问题。
+# （`bin/cold-backup: line N: cold-backup: command not found`）。用 stderr 干净与否兜住这类问题。
 initconf="$ROOT/.lint-init-probe.conf"
-init_err="$(DEV_BACKUP_CONFIG="$tmpconf" "$BIN" --config "$initconf" --init --dry-run 2>&1 >/dev/null)"
+init_err="$(COLD_BACKUP_CONFIG="$tmpconf" "$BIN" --config "$initconf" --init --dry-run 2>&1 >/dev/null)"
 if [ -n "$init_err" ]; then
   no "--init --dry-run 往 stderr 写了东西（反引号被当命令替换了？）：${init_err}"
 else
@@ -114,10 +114,10 @@ fi
 if [ -e "$initconf" ]; then no "--init --dry-run 竟然写了文件"; rm -f "$initconf"; else ok "--init --dry-run 没写文件"; fi
 
 hdr "7 未配置时的 JSON 必须合法（下游解析它，不能是半截）"
-json="$(DEV_BACKUP_CONFIG="$tmpconf" "$BIN" --status --json 2>/dev/null)"; rc=$?
+json="$(COLD_BACKUP_CONFIG="$tmpconf" "$BIN" --status --json 2>/dev/null)"; rc=$?
 [ "$rc" -eq 2 ] && ok "未配置时 --status --json 退出码 2" || no "未配置时退出码应为 2，实得 $rc"
 if have python3; then
-  if printf '%s' "$json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"]=="dev-backup.status/1"; assert d["verdict"] in ("ok","bad"); assert any(r["code"]=="unconfigured" for r in d["reasons"])' 2>/dev/null; then
+  if printf '%s' "$json" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["schema"]=="cold-backup.status/1"; assert d["verdict"] in ("ok","bad"); assert any(r["code"]=="unconfigured" for r in d["reasons"])' 2>/dev/null; then
     ok "JSON 可被 python3 解析，且 schema/verdict/reasons 都自洽"
   else
     no "未配置时的 JSON 解析失败或字段不对"
@@ -130,7 +130,7 @@ hdr "8 README 与文档"
 for f in README.md README.en.md docs/compatibility.md docs/scheduling.md docs/restore.md docs/decisions.md AGENTS.md HANDOFF.md; do
   [ -s "$ROOT/$f" ] && ok "有 $f" || no "缺 $f"
 done
-grep -q 'dev-backup.status/1' "$ROOT/README.md" && ok "README 指向契约文档" || no "README 没提契约"
+grep -q 'cold-backup.status/1' "$ROOT/README.md" && ok "README 指向契约文档" || no "README 没提契约"
 
 printf '\n== 静态检查结果：%s 项通过，%s 项失败\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

@@ -4,10 +4,17 @@
 
 ## 当前写者
 
-- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.2（同秒并列两个修复）已发布**；trusted publishing 待查）
+- 工具：DSH（2026-10-02 晚）—— **改名进行中**
 - 分支：main
-- 开始时间：—
-- 本轮：① 新增两个防护（都是 1.0.0 发布后实测出来的）：**`DEST` 不许落在工作区里**（会自我繁殖：
+- 开始时间：2026-10-02 22:15 (+09:00)
+- 本轮：**改名** —— 引擎 CLI `dev-backup` → **`cold-backup`**，与 DSH 插件
+  `dsh-dev-backup` → `dsh-cold-backup` 同步：包名、可执行文件 `bin/cold-backup`、
+  环境变量前缀 `DEV_BACKUP_*` → `COLD_BACKUP_*`、默认目录 `~/Library/Logs/cold-backup`（Linux
+  `~/.local/state/cold-backup`）、配置文件 `~/.config/cold-backup/config`、JSON 契约
+  `cold-backup.status/1`、归属标记 `.cold-backup-owner`、crontab 标记与 launchd label 一并换名，
+  **不留旧名兼容**。本文件下文与 `docs/decisions.md` 里的旧名是当时的真实名称，作为历史记录不回改
+  （下文出现的路径 `~/dev/dev-backup` 就是今天的 `~/dev/cold-backup`）。
+- 上一轮：① 新增两个防护（都是 1.0.0 发布后实测出来的）：**`DEST` 不许落在工作区里**（会自我繁殖：
   快照把上一轮产物打进去，实测 3 轮 3194 → 6945 → 14110 字节）、**`schedule install --program`
   不可执行时当场警告**（否则任务每天静默失败）。② 试走 trusted publishing **失败**
   （CI `PUT` 404，npm 侧配置未匹配），最终**用本机 token 发布 1.0.1（无 provenance）**；
@@ -16,6 +23,18 @@
 > 一个仓库同一时刻只允许一个写者。交接时把上一行改成自己，并先读完下面的状态。
 
 ## 当前状态
+
+**2026-10-02 追加（六）：改名 —— CLI `dev-backup` → `cold-backup`（本轮，已本地验证）。**
+
+- 目录 `~/dev/dev-backup` → `~/dev/cold-backup`；可执行文件 `bin/dev-backup` → `bin/cold-backup`。
+- 一次性换掉的标识：环境变量 `COLD_BACKUP_*`、配置文件 `~/.config/cold-backup/config`、
+  macOS 日志目录 `~/Library/Logs/cold-backup`（其它平台 `~/.local/state/cold-backup`）、
+  JSON schema `cold-backup.status/1`、归属标记 `.cold-backup-owner`、crontab 标记
+  `# >>> cold-backup >>>`、launchd label 模板 `com.cold-backup.daily`、临时文件名前缀。
+  **不留旧名兼容** —— 理由、代价与迁移命令见 `docs/decisions.md` 顶部与 `docs/compatibility.md` §7
+  （旧标记在新版眼里等于「没标记」，按 `unowned` 处理，不会误删）。
+- 验证：`test/lint.sh` **38/38**、`test/selftest.sh` **211/211**、`test/frozen-clock.sh` **211/211**。
+- 配对改动：DSH 插件 `dsh-dev-backup` → `dsh-cold-backup`（同一批次，见那个仓库）。
 
 **已公开发布**：[GitHub](https://github.com/haotian-lu-prog/dev-backup)（public，
 Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/package/dev-backup)

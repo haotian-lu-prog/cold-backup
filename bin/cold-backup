@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dev-backup —— 把「一个装着很多 git 仓库的工作区」冷备到一个目录
+# cold-backup —— 把「一个装着很多 git 仓库的工作区」冷备到一个目录
 #
 # 产物直接落进你指定的备份目录（OneDrive / iCloud / Dropbox 的同步目录，或任意磁盘），
 # 由同步客户端负责上传；不依赖 rclone / restic。
@@ -11,31 +11,31 @@
 # 备份目录里只有**不可变**内容：只新增 / 删除，绝不原地改已有文件。
 #
 # 用法：
-#   dev-backup                        跑一次备份（幂等：同一提交不重复打包）
-#   dev-backup --status               新鲜度 + 上传状态；有问题时退出 1
-#   dev-backup --status --json        同上，但输出 dev-backup.status/1 JSON
-#   dev-backup --verify [--fix]       逐份校验全部产物；--fix 顺手删掉损坏的
-#   dev-backup --daily                每日巡检：补跑备份 + 逐份校验 + 状态检查
-#   dev-backup --prune-orphans [--apply]   清理备份目录里已不对应任何目标的残留（默认只列）
-#   dev-backup --restore-drill [目录] 真还原演练：镜像 clone 每个最新 bundle，比对 ref 与提交数
-#   dev-backup schedule install|uninstall|status [--dry-run]
+#   cold-backup                        跑一次备份（幂等：同一提交不重复打包）
+#   cold-backup --status               新鲜度 + 上传状态；有问题时退出 1
+#   cold-backup --status --json        同上，但输出 cold-backup.status/1 JSON
+#   cold-backup --verify [--fix]       逐份校验全部产物；--fix 顺手删掉损坏的
+#   cold-backup --daily                每日巡检：补跑备份 + 逐份校验 + 状态检查
+#   cold-backup --prune-orphans [--apply]   清理备份目录里已不对应任何目标的残留（默认只列）
+#   cold-backup --restore-drill [目录] 真还原演练：镜像 clone 每个最新 bundle，比对 ref 与提交数
+#   cold-backup schedule install|uninstall|status [--dry-run]
 #                                     装/卸/查定时任务（macOS 用 launchd，其他用 cron）
-#   dev-backup --init [--force]       写一份配置文件模板
-#   dev-backup --version
+#   cold-backup --init [--force]       写一份配置文件模板
+#   cold-backup --version
 #
-# 配置优先级：命令行 > 环境变量（DEV_BACKUP_* / DEV_ROOT）> 配置文件 > 内置默认。
-# 配置文件默认 `~/.config/dev-backup/config`（KEY=VALUE，见 --init 生成的模板）。
+# 配置优先级：命令行 > 环境变量（COLD_BACKUP_* / DEV_ROOT）> 配置文件 > 内置默认。
+# 配置文件默认 `~/.config/cold-backup/config`（KEY=VALUE，见 --init 生成的模板）。
 # 退出码：0 = 一切正常；1 = 有问题；2 = 用法或配置错误。
 set -uo pipefail
 
 if [ -z "${BASH_VERSION:-}" ]; then
-  printf 'dev-backup 需要 bash（当前不是 bash 在跑）。\n' >&2
+  printf 'cold-backup 需要 bash（当前不是 bash 在跑）。\n' >&2
   exit 2
 fi
 
 VERSION="1.0.2"
-SCHEMA="dev-backup.status/1"
-PROG="${DEV_BACKUP_PROG:-$(basename "$0")}"
+SCHEMA="cold-backup.status/1"
+PROG="${COLD_BACKUP_PROG:-$(basename "$0")}"
 SELF="$0"
 case "$SELF" in /*) ;; *) SELF="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")" ;; esac
 
@@ -110,8 +110,8 @@ usage() { sed -n '2,31p' "$SELF" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    # `schedule` 出现在哪个位置都行：`dev-backup schedule install --at 7:00` 与
-    # `dev-backup --kind cron schedule install --at 7:00` 都要能用（后者一开始被当成未知参数）。
+    # `schedule` 出现在哪个位置都行：`cold-backup schedule install --at 7:00` 与
+    # `cold-backup --kind cron schedule install --at 7:00` 都要能用（后者一开始被当成未知参数）。
     schedule)
       MODE="schedule"; shift
       if [ $# -gt 0 ]; then case "$1" in -*) ;; *) SCHED_ACTION="$1"; shift ;; esac; fi
@@ -175,7 +175,7 @@ conf_raw() { # $1=键；取最后一次出现的值
   printf '%s' "$line"
 }
 
-conf_value() { # $1=短名 $2=全名（如 DEV_BACKUP_DEST）
+conf_value() { # $1=短名 $2=全名（如 COLD_BACKUP_DEST）
   local v
   v="$(conf_raw "$1")"
   [ -n "$v" ] && { printf '%s' "$v"; return 0; }
@@ -228,7 +228,7 @@ cfg() { # $1=env 名 $2=配置短名 $3=命令行值 $4=默认值
   printf '%s' "$(expand_path "$v")"
 }
 
-# 配置文件位置：--config > DEV_BACKUP_CONFIG > XDG 默认
+# 配置文件位置：--config > COLD_BACKUP_CONFIG > XDG 默认
 if [ -n "$OPT_CONFIG" ]; then
   CONF_FILE="$(expand_path "$OPT_CONFIG")"
   # 显式指了文件却不存在 → 明确报错（别静默用默认值干活）。但 `--init` 就是来**创建**它的。
@@ -237,46 +237,46 @@ if [ -n "$OPT_CONFIG" ]; then
     exit 2
   fi
 else
-  CONF_FILE="$(expand_path "${DEV_BACKUP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dev-backup/config}")"
+  CONF_FILE="$(expand_path "${COLD_BACKUP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/cold-backup/config}")"
 fi
 
 # ── 配置项 ───────────────────────────────────────────────────────────────────
 DEV_ROOT="$(cfg DEV_ROOT ROOT "$OPT_ROOT" "$HOME/dev")"
-DEST="$(cfg DEV_BACKUP_DEST DEST "$OPT_DEST" "")"
+DEST="$(cfg COLD_BACKUP_DEST DEST "$OPT_DEST" "")"
 if [ -n "$OPT_LOGDIR" ]; then
   LOG_DIR="$(expand_path "$OPT_LOGDIR")"
 else
-  LOG_DIR="$(cfg DEV_BACKUP_LOGDIR LOGDIR "" "")"
+  LOG_DIR="$(cfg COLD_BACKUP_LOGDIR LOGDIR "" "")"
   if [ -z "$LOG_DIR" ]; then
-    if [ "$IS_DARWIN" = "1" ]; then LOG_DIR="$HOME/Library/Logs/dev-backup"
-    else LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dev-backup"; fi
+    if [ "$IS_DARWIN" = "1" ]; then LOG_DIR="$HOME/Library/Logs/cold-backup"
+    else LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/cold-backup"; fi
   fi
 fi
-KEEP="$(cfg DEV_BACKUP_KEEP KEEP "" 10)"
-LOCK_WAIT="$(cfg DEV_BACKUP_LOCK_WAIT LOCK_WAIT "" 600)"
-DEPTH="$(cfg DEV_BACKUP_DEPTH DEPTH "" 3)"
-DO_SNAPSHOTS="$(cfg DEV_BACKUP_SNAPSHOTS SNAPSHOTS "" 1)"
-INCLUDE_ENV="$(cfg DEV_BACKUP_INCLUDE_ENV INCLUDE_ENV "" 0)"
-NO_NOTIFY="$(cfg DEV_BACKUP_NO_NOTIFY NO_NOTIFY "" 0)"
-NOTIFY_TITLE="$(cfg DEV_BACKUP_NOTIFY_TITLE NOTIFY_TITLE "" "dev-backup（工作区冷备）")"
-UPLOAD_GRACE="$(cfg DEV_BACKUP_UPLOAD_GRACE UPLOAD_GRACE "" 600)"
-EXCLUDES="$(cfg DEV_BACKUP_EXCLUDES EXCLUDES "" "")"
-DRILL_BASE="$(cfg DEV_BACKUP_DRILL_DIR DRILL_DIR "" "")"
-FDA_APP="$(cfg DEV_BACKUP_FDA_APP FDA_APP "" "")"
-CONFIGS_SPEC="$(cfg DEV_BACKUP_CONFIGS CONFIGS "" "off")"
-SCHED_LABEL="$(cfg DEV_BACKUP_LABEL LABEL "$SCHED_LABEL" "com.dev-backup.daily")"
+KEEP="$(cfg COLD_BACKUP_KEEP KEEP "" 10)"
+LOCK_WAIT="$(cfg COLD_BACKUP_LOCK_WAIT LOCK_WAIT "" 600)"
+DEPTH="$(cfg COLD_BACKUP_DEPTH DEPTH "" 3)"
+DO_SNAPSHOTS="$(cfg COLD_BACKUP_SNAPSHOTS SNAPSHOTS "" 1)"
+INCLUDE_ENV="$(cfg COLD_BACKUP_INCLUDE_ENV INCLUDE_ENV "" 0)"
+NO_NOTIFY="$(cfg COLD_BACKUP_NO_NOTIFY NO_NOTIFY "" 0)"
+NOTIFY_TITLE="$(cfg COLD_BACKUP_NOTIFY_TITLE NOTIFY_TITLE "" "cold-backup（工作区冷备）")"
+UPLOAD_GRACE="$(cfg COLD_BACKUP_UPLOAD_GRACE UPLOAD_GRACE "" 600)"
+EXCLUDES="$(cfg COLD_BACKUP_EXCLUDES EXCLUDES "" "")"
+DRILL_BASE="$(cfg COLD_BACKUP_DRILL_DIR DRILL_DIR "" "")"
+FDA_APP="$(cfg COLD_BACKUP_FDA_APP FDA_APP "" "")"
+CONFIGS_SPEC="$(cfg COLD_BACKUP_CONFIGS CONFIGS "" "off")"
+SCHED_LABEL="$(cfg COLD_BACKUP_LABEL LABEL "$SCHED_LABEL" "com.cold-backup.daily")"
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="$LOG_DIR/backup.log"
 LOCK="$LOG_DIR/.lock"
 TMP="$LOG_DIR/tmp"
 
-# 归属标记：备份目录里每个目标目录放一份 `.dev-backup-owner`，内容是「工作区 ID」。
+# 归属标记：备份目录里每个目标目录放一份 `.cold-backup-owner`，内容是「工作区 ID」。
 # 为什么需要它：两个工作区（或两台机器）指向**同一个备份目录**时，标签可能撞名，
 # 彼此的产物会被对方的 --prune-orphans 当成「残留」删掉 —— 那是数据丢失，不是清理。
 # 默认 ID = 主机名 + 工作区根路径的指纹；同一台机器搬目录后 ID 会变，用 WORKSPACE_ID 固定。
-OWNER_FILE=".dev-backup-owner"
-WS_ID="$(cfg DEV_BACKUP_WORKSPACE_ID WORKSPACE_ID "" "")"
+OWNER_FILE=".cold-backup-owner"
+WS_ID="$(cfg COLD_BACKUP_WORKSPACE_ID WORKSPACE_ID "" "")"
 if [ -z "$WS_ID" ]; then
   WS_ID="$(printf '%s\n%s\n' "$(hostname 2>/dev/null || echo unknown-host)" "$DEV_ROOT" | sha256_stdin | cut -c1-12)"
 fi
@@ -299,11 +299,11 @@ owner_class() { # $1=相对路径（如 repos/demo）→ ours | unowned | foreig
 # 没配 DEST 时能不能干活：备份/校验/演练不能，--status 要输出「未配置」这个事实。
 require_dest() {
   [ -n "$DEST" ] && return 0
-  printf '还没有配置备份目标（DEST）。\n  跑 `%s --init` 生成配置文件模板，或设环境变量 DEV_BACKUP_DEST。\n' "$PROG" >&2
+  printf '还没有配置备份目标（DEST）。\n  跑 `%s --init` 生成配置文件模板，或设环境变量 COLD_BACKUP_DEST。\n' "$PROG" >&2
   exit 2
 }
 
-if [ -n "${DEV_BACKUP_DISABLE:-}" ] && [ "$DEV_BACKUP_DISABLE" = "1" ] && [ "$MODE" = "backup" ]; then
+if [ -n "${COLD_BACKUP_DISABLE:-}" ] && [ "$COLD_BACKUP_DISABLE" = "1" ] && [ "$MODE" = "backup" ]; then
   exit 0
 fi
 
@@ -620,7 +620,7 @@ store_snapshot_file() { # $1=标签 $2=目标目录 $3=临时 tar.gz $4=类型�
 # 以及可重装的大体积内容，还有**项目运行时目录**。白名单只收「设置 + 指令文件 +
 # profile/agent 定义」，要加东西必须显式写进来。
 # 格式：<标签>|<家目录>|<相对路径1>,<相对路径2>,...
-# 默认 off（不认识你的 home 长什么样，不猜）；用 CONFIGS 或 DEV_BACKUP_CONFIGS 显式打开。
+# 默认 off（不认识你的 home 长什么样，不猜）；用 CONFIGS 或 COLD_BACKUP_CONFIGS 显式打开。
 config_spec() {
   [ "${CONFIGS_SPEC:-off}" = "off" ] && return 0
   # 多条用 `;` 分隔：配置文件是「一行一个 KEY=VALUE」，写不了多行值
@@ -681,7 +681,7 @@ backup_config() { # $1=标签 $2=家目录 $3=逗号分隔的相对路径
 write_readme() { # 说明文件：内容变了就刷新（否则备份目录里那份会一直是旧说明）
   local tmp="$TMP/README.md.new"
   cat >"$tmp" <<EOF
-# 冷备目录（由 \`dev-backup\` 生成）
+# 冷备目录（由 \`cold-backup\` 生成）
 
 工作区根：\`$DEV_ROOT\`
 只放冷备产物，**不要**把活仓库、node_modules、构建产物搬进来。
@@ -724,7 +724,7 @@ $PROG --restore-drill
 ## 注意
 
 - 云盘里的是**冷备**：OneDrive 之类的按需下载（占位文件）下 \`git clone\` 会自动触发下载，首次可能慢。
-- 快照默认排除 \`.env\` / \`.env.*\`（不加密上云），需要时用 \`DEV_BACKUP_INCLUDE_ENV=1\` 重跑。
+- 快照默认排除 \`.env\` / \`.env.*\`（不加密上云），需要时用 \`COLD_BACKUP_INCLUDE_ENV=1\` 重跑。
 - 保存策略：每个目标保留最新 \`KEEP\`（默认 10）个产物，更旧的自动轮转删除。
 - 校验：\`--verify\` 会逐份检查（bundle 会真 clone 一次 + fsck）；\`--status\` 只查最新那份 + 云端上传状态。
 - 仓库改名/删除后会留下不再对应任何目标的目录：\`--status\` 会列出来，清理用 \`--prune-orphans\`（默认只列不删）再加 \`--apply\`。
@@ -1030,7 +1030,7 @@ run_status() {
   return "$S_RC"
 }
 
-# ── JSON 渲染（契约 dev-backup.status/1；消费者：macOS 面板、DSH 插件）───────
+# ── JSON 渲染（契约 cold-backup.status/1；消费者：macOS 面板、DSH 插件）───────
 # 退出码与 --status 完全一致：0 = 一切都好，1 = 有问题。JSON 里另有 verdict 字段，
 # 让消费方不必靠退出码猜（也便于未来加 warn 档而不破坏 rc 语义）。
 json_escape() {
@@ -1252,7 +1252,7 @@ run_verify() {
           side_bad=0
           sidecar_ok "$f" || side_bad=1
           # 最新那份 + 指纹可疑的，做真 clone 校验；其余至少过一遍 bundle 结构校验
-          if [ "$side_bad" -eq 1 ] || [ "$f" = "$b" ] || [ "${DEV_BACKUP_DEEP_ALL:-0}" = "1" ]; then
+          if [ "$side_bad" -eq 1 ] || [ "$f" = "$b" ] || [ "${COLD_BACKUP_DEEP_ALL:-0}" = "1" ]; then
             if deep_verify_bundle "$f"; then
               [ "$side_bad" -eq 1 ] && out "  ! $(basename "$f")：.sha256 缺失或不符，但内容可还原" \
                                     || out "  ✓ $(basename "$f")：可完整 clone（fsck 通过）"
@@ -1419,13 +1419,13 @@ cron_block() { # 打印受管区块（前后有哨兵行，安装时整块替换
   local hp mp parts
   parts="$(sched_time_parts)" || return 1
   hp="${parts%% *}"; mp="${parts##* }"
-  printf '# >>> dev-backup >>>\n'
+  printf '# >>> cold-backup >>>\n'
   printf '%s %s * * * %s --daily --trigger=cron >> %s 2>&1\n' "$mp" "$hp" "$(sched_program)" "$(sched_log)"
-  printf '# <<< dev-backup <<<\n'
+  printf '# <<< cold-backup <<<\n'
 }
 
 cron_without_block() { # 现有 crontab 去掉受管区块；没有 crontab 时输出空
-  crontab -l 2>/dev/null | sed '/^# >>> dev-backup >>>$/,/^# <<< dev-backup <<<$/d' | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba'
+  crontab -l 2>/dev/null | sed '/^# >>> cold-backup >>>$/,/^# <<< cold-backup <<<$/d' | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba'
 }
 
 sched_install() {
@@ -1476,11 +1476,11 @@ sched_install() {
     return 0
   fi
   have crontab || { printf '本机没有 crontab 命令（Linux 上装 cron 或改用 systemd timer）\n' >&2; return 1; }
-  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
+  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/cold-backup-cron.XXXXXX")" || return 1
   { cron_without_block; cron_block; } >"$candidate" || { rm -f "$candidate"; return 1; }
   crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败（原 crontab 未改动）\n' >&2; return 1; }
   rm -f "$candidate"
-  if crontab -l 2>/dev/null | grep -Fq '>>> dev-backup >>>'; then
+  if crontab -l 2>/dev/null | grep -Fq '>>> cold-backup >>>'; then
     out "  ✓ 已安装 cron 任务（每天 $SCHED_AT 跑 --daily）"
     out "    日志：$(sched_log)"
   else
@@ -1501,7 +1501,7 @@ sched_uninstall() {
   fi
   if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会从 crontab 里删掉受管区块"; return 0; fi
   have crontab || { printf '本机没有 crontab 命令\n' >&2; return 1; }
-  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
+  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/cold-backup-cron.XXXXXX")" || return 1
   cron_without_block >"$candidate" || { rm -f "$candidate"; return 1; }
   crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败\n' >&2; return 1; }
   rm -f "$candidate"
@@ -1523,9 +1523,9 @@ sched_status() {
     return 0
   fi
   have crontab || { out "  · 本机没有 crontab 命令"; return 0; }
-  if crontab -l 2>/dev/null | grep -Fq '>>> dev-backup >>>'; then
+  if crontab -l 2>/dev/null | grep -Fq '>>> cold-backup >>>'; then
     out "  ✓ crontab 里有受管区块："
-    crontab -l 2>/dev/null | sed -n '/^# >>> dev-backup >>>$/,/^# <<< dev-backup <<<$/p' | sed 's/^/    /'
+    crontab -l 2>/dev/null | sed -n '/^# >>> cold-backup >>>$/,/^# <<< cold-backup <<<$/p' | sed 's/^/    /'
   else
     out "  · crontab 里没有受管区块"
   fi
@@ -1554,8 +1554,8 @@ run_init() {
   if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会写入：$target"; return 0; fi
   mkdir -p "$(dirname "$target")" || { printf '无法创建 %s\n' "$(dirname "$target")" >&2; return 1; }
   cat >"$target" <<'EOF'
-# dev-backup 配置文件：KEY=VALUE，一行一个；`#` 开头是注释。
-# 优先级：命令行 > 环境变量（DEV_BACKUP_* / DEV_ROOT）> 本文件 > 内置默认。
+# cold-backup 配置文件：KEY=VALUE，一行一个；`#` 开头是注释。
+# 优先级：命令行 > 环境变量（COLD_BACKUP_* / DEV_ROOT）> 本文件 > 内置默认。
 # 键名可以写短名（ROOT）也可以写环境变量全名（DEV_ROOT）。
 
 # 要备份的「工作区根」：它下面第一层的 git 仓库会被打成 bundle（默认 ~/dev）
@@ -1565,10 +1565,10 @@ ROOT=~/dev
 
 # 备份目标目录（必填）：产物直接落在这里，同步客户端负责上传
 # 例：OneDrive / iCloud / Dropbox 的同步目录，或一块外置磁盘
-DEST=~/Backup/dev-backup
+DEST=~/Backup/cold-backup
 
-# 日志与状态目录（默认 macOS: ~/Library/Logs/dev-backup；其他: ~/.local/state/dev-backup）
-# LOGDIR=~/.local/state/dev-backup
+# 日志与状态目录（默认 macOS: ~/Library/Logs/cold-backup；其他: ~/.local/state/cold-backup）
+# LOGDIR=~/.local/state/cold-backup
 
 # 每个目标保留多少个产物，更旧的轮转删除（默认 10）
 # KEEP=10
@@ -1587,7 +1587,7 @@ DEST=~/Backup/dev-backup
 # CONFIGS=editor|~/.config/my-editor|settings.json,keymap.json;shell|~/.config/fish|config.fish
 
 # 通知标题（macOS 用 osascript，Linux 用 notify-send；两者都没有时静默跳过）
-# NOTIFY_TITLE=dev-backup（工作区冷备）
+# NOTIFY_TITLE=cold-backup（工作区冷备）
 # 关掉桌面通知
 # NO_NOTIFY=1
 
@@ -1601,7 +1601,7 @@ DEST=~/Backup/dev-backup
 # FDA_APP=~/Applications/Backup.app
 
 # 定时任务的 label（仅 macOS launchd）
-# LABEL=com.dev-backup.daily
+# LABEL=com.cold-backup.daily
 EOF
   out "  ✓ 已写入配置模板：$target"
   out "    下一步：把 ROOT 与 DEST 改成你自己的路径，然后跑 ${PROG} --status"

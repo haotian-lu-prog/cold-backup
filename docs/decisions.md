@@ -2,6 +2,41 @@
 
 倒序追加。每条写清：背景、选项、结论、代价。三家工具都读这个文件，所以**不要只把决定留在会话里**。
 
+> 读旧条目时注意：**2026-10-02 之前的条目里出现的 `dev-backup` / `dsh-dev-backup` /
+> `.dev-backup-owner` 等名字，是当时的真实名称**，不改写（它们是历史事实，改了就撒谎）。
+> 对应今天的 `cold-backup` / `dsh-cold-backup` / `.cold-backup-owner`，映射表见
+> [compatibility.md §7](compatibility.md)。
+
+---
+
+## 2026-10-02 — 改名：`dev-backup` → `cold-backup`、`dsh-dev-backup` → `dsh-cold-backup`
+
+- **背景**：这两个名字里的 `dev` 既不准确也不自解释 —— 「dev-backup」读起来像「开发用的备份」，
+  而它实际做的是**冷备**（离线快照 + 可还原，区别于实时同步）。作者拍板：名字里要出现「冷备」。
+- **选项**：A 只改包名与命令名，路径 / 环境变量 / JSON schema 等契约标识继续用 `dev-backup`
+  （改动最小，但从此两套名字并存 —— 正是要避免的那种不一致）；B 全部改，干净断代；
+  C 新名为主 + 兼容旧名（读旧路径、接受旧环境变量）。
+- **结论**：**B**。依据是「几乎还没有存量用户」这个窗口不会一直在：两个包 2026-09-30 才发布，
+  已知用户只有作者本人，此时断代成本最低；拖到有用户之后再改，就得永久养 C 那层兼容。
+  换名清单：包名、可执行文件 `bin/cold-backup`、`COLD_BACKUP_*` 环境变量、默认目录
+  `~/Library/Logs/cold-backup`（Linux `~/.local/state/cold-backup`）、配置文件
+  `~/.config/cold-backup/config`、JSON schema `cold-backup.status/1`、归属标记
+  `.cold-backup-owner`、crontab 标记 `# >>> cold-backup >>>`、launchd label 模板
+  `com.cold-backup.daily`、临时文件名前缀。插件侧同步：包名 / 入口 id / 路由
+  `/dsh-cold-backup/status` / 默认状态文件路径 / schema 前缀。
+- **代价 / 后续**：
+  ① **npm 不支持给包改名** —— 旧包 `dev-backup`、`dsh-dev-backup` 只能 deprecate（附指向新名的说明），
+     不能重定向；GitHub 仓库可以改名，旧 URL 自动 301。
+  ② 已存在的备份目录里是旧标记 `.dev-backup-owner`：在新版本眼里等于**没有标记**，
+     按 `unowned`（「大概是自己的」）处理，行为与旧版一致、不会误删；要恢复标记语义需手工
+     `mv`（`compatibility.md` §7 给了命令）。
+  ③ **旧定时任务不会被接管**：crontab 标记与 launchd label 都换了，不手工卸载就会每天跑两次。
+  ④ 本机私有链路（`_shared/bin/backup-dev.sh` + macOS 面板）跟着改 `LOG_DIR` 默认值；
+     私有脚本自己的 `DEV_BACKUP_*` 变量名属于私有仓库内部接口，**不在**本次改名范围内 ——
+     公开 CLI 与私有脚本是两个程序，各自的名字各自管。
+  ⑤ 版本号**不跳**：`cold-backup` 首发就是 `1.0.2`、`dsh-cold-backup` 首发就是 `1.1.1`，
+     与旧包同版本同内容（只差名字），让装了旧包的人能一对一地迁过来。
+
 ---
 
 ## 2026-10-02 — 同秒并列：轮转不许删「刚写出的产物」，校验/演练按 HEAD 挑产物

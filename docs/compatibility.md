@@ -1,21 +1,21 @@
 # 兼容性契约（下游消费者看这份）
 
-这份文档写给**解析 `dev-backup` 输出的人**：看板插件、GUI 面板、你自己的脚本。
+这份文档写给**解析 `cold-backup` 输出的人**：看板插件、GUI 面板、你自己的脚本。
 里面的东西一旦发布就不轻易改；改之前先看最后一节「什么算破坏性变更」。
 
 ## 1. 命令行与退出码
 
 | 调用 | 退出码 |
 |---|---|
-| `dev-backup [--trigger=名]` | 0 成功；1 失败（同时写 `last-failure` 并发通知） |
-| `dev-backup --status` | 0 全绿；1 有问题 |
-| `dev-backup --status --json`（裸 `--json` 等价） | 与 `--status` **完全一致**；JSON 永远合法（目标目录不存在时也输出） |
-| `dev-backup --verify [--fix]` | 0 / 1。`--fix` 删掉损坏产物**仍返回 1**（「这轮巡检发现了问题」这个事实不该被删掉动作抹平） |
-| `dev-backup --daily` | 0 / 1 |
-| `dev-backup --prune-orphans [--apply]` | 目标目录不存在 1；删除失败 1；否则 0 |
-| `dev-backup --restore-drill [目录]` | 0 / 1 |
-| `dev-backup --init` | 0 写入；2 已存在且没给 `--force` |
-| `dev-backup schedule …` | 0 / 1 / 2 |
+| `cold-backup [--trigger=名]` | 0 成功；1 失败（同时写 `last-failure` 并发通知） |
+| `cold-backup --status` | 0 全绿；1 有问题 |
+| `cold-backup --status --json`（裸 `--json` 等价） | 与 `--status` **完全一致**；JSON 永远合法（目标目录不存在时也输出） |
+| `cold-backup --verify [--fix]` | 0 / 1。`--fix` 删掉损坏产物**仍返回 1**（「这轮巡检发现了问题」这个事实不该被删掉动作抹平） |
+| `cold-backup --daily` | 0 / 1 |
+| `cold-backup --prune-orphans [--apply]` | 目标目录不存在 1；删除失败 1；否则 0 |
+| `cold-backup --restore-drill [目录]` | 0 / 1 |
+| `cold-backup --init` | 0 写入；2 已存在且没给 `--force` |
+| `cold-backup schedule …` | 0 / 1 / 2 |
 | 未知参数、`--json` 配非 `--status`、配置文件不存在 | 2 |
 
 **约定**：`0` = 一切都好；`1` = 有事实问题；`2` = 你（调用方）用错了。
@@ -26,14 +26,14 @@
 - 人读模式：`== …` 头 + 每行 `  ✓ / ✗ / ! …`（中文）。**不是契约**，不要解析。
 - JSON 模式：**stdout 只有一份 JSON，stderr 必须为空**。带 `--json` 时任何调试信息都不许混进 stdout。
 
-## 3. JSON 契约 `dev-backup.status/1`
+## 3. JSON 契约 `cold-backup.status/1`
 
 ```json
 {
-  "schema": "dev-backup.status/1",
+  "schema": "cold-backup.status/1",
   "generatedAt": 1790937202,
   "root": "/Users/you/dev",
-  "dest": "/Users/you/Backup/dev-backup",
+  "dest": "/Users/you/Backup/cold-backup",
   "verdict": "ok",
   "lastOk": 1790936761,
   "lastFailure": { "epoch": 1790930000, "trigger": "post-commit", "message": "打包失败：foo" },
@@ -54,7 +54,7 @@
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `schema` | string | 恒为 `dev-backup.status/1`。**前缀匹配 `dev-backup.status/`**，别用它当版本号做严格相等以外的推断 |
+| `schema` | string | 恒为 `cold-backup.status/1`。**前缀匹配 `cold-backup.status/`**，别用它当版本号做严格相等以外的推断 |
 | `generatedAt` | epoch 秒 | 这份文档的生成时间 |
 | `root` / `dest` | string | 工作区根 / 备份目标（未配置 `dest` 时是空串） |
 | `verdict` | `"ok"` \| `"bad"` | 与退出码一致。**只有这两个值**（加第三档会让老消费者静默丢弃整份文档） |
@@ -118,7 +118,7 @@
   「秒相同、只差 sha 后缀」的**并列**产物 —— 此时「按文件名取最新」是不可判定的，
   消费方**不要**依赖并列时的顺序。（工具自己也不依赖：`--status` 判断的是「**HEAD 的 sha**
   那一份在不在」，不是「文件名最大的那份」。）
-- `<DEST>/repos|snapshots|configs/<标签>/.dev-backup-owner` —— 归属标记，内容是工作区 ID。
+- `<DEST>/repos|snapshots|configs/<标签>/.cold-backup-owner` —— 归属标记，内容是工作区 ID。
   **不是**产物，不要当产物校验，也不要在没有把握时删它。
 - `<DEST>/manifests/*.tsv` —— 8 列 `epoch / kind / label / sha / count / file / bytes / sha256`。
   它是**留给人排查的不可变记录**，目前没有任何消费方解析它；改列不算破坏性变更，但也别指望它稳定。
@@ -135,17 +135,60 @@
 
 改这些**不**算：人读文本、日志措辞、manifest 列、`--help` 文案、新增可选字段。
 
+> 例外记一笔：2026-10-02 的**改名**（§7）就是一次**有意**的破坏性变更 —— 趁已知用户只有作者本人，
+> 把 `schema` 常量、路径、环境变量一次性换干净，而不是永久养一层旧名兼容。之后再没有这种窗口。
+
 ## 6. 现在的消费者
 
 | 消费者 | 怎么读 |
 |---|---|
-| [dsh-dev-backup](https://www.npmjs.com/package/dsh-dev-backup)（DeepSeek Harness 插件） | 跑 `<命令> --status --json`，前缀匹配 schema，`verdict` 驱动红绿；也可退回读 `last-ok` / `last-failure` |
+| [dsh-cold-backup](https://www.npmjs.com/package/dsh-cold-backup)（DeepSeek Harness 插件） | 跑 `<命令> --status --json`，前缀匹配 schema，`verdict` 驱动红绿；也可退回读 `last-ok` / `last-failure` |
 | 自建 macOS 面板 | 同一份 JSON 渲染成逐目标明细；也直接读 `last-ok` / `last-failure` |
 | `--status` 自己 | 人读出口 —— 与 JSON 是**同一次判定**的两个渲染，不是两套规则 |
 
 跑这两条可以验证契约没漂：
 
 ```sh
-dev-backup --status --json | python3 -m json.tool     # JSON 合法
-dev-backup --status | grep -c '✓'                      # 人读 ✓ 行数 == JSON 里 state=ok 的条数 + 1
+cold-backup --status --json | python3 -m json.tool     # JSON 合法
+cold-backup --status | grep -c '✓'                      # 人读 ✓ 行数 == JSON 里 state=ok 的条数 + 1
 ```
+
+## 7. 改名（2026-10-02）：`dev-backup` → `cold-backup`
+
+这个工具 2026-09-30 首次公开发布时叫 **`dev-backup`**（npm 包名、命令名、GitHub 仓库名都是它）。
+2026-10-02 起统一改成 **`cold-backup`** —— `dev` 既不准确也不自解释，它做的是**冷备**
+（离线快照 + 可还原），不是实时同步。DSH 插件同步改名：`dsh-dev-backup` → `dsh-cold-backup`。
+
+**换代是干净的：不保留任何旧名兼容。** 一起换掉的标识：
+
+| 类别 | 旧 | 新 |
+|---|---|---|
+| npm 包名 / 命令名 | `dev-backup` | `cold-backup` |
+| 环境变量前缀 | `DEV_BACKUP_*` | `COLD_BACKUP_*` |
+| 配置文件 | `~/.config/dev-backup/config` | `~/.config/cold-backup/config` |
+| 日志目录（macOS） | `~/Library/Logs/dev-backup` | `~/Library/Logs/cold-backup` |
+| 日志目录（其它平台） | `~/.local/state/dev-backup` | `~/.local/state/cold-backup` |
+| JSON schema | `dev-backup.status/1` | `cold-backup.status/1` |
+| 归属标记 | `.dev-backup-owner` | `.cold-backup-owner` |
+| crontab 标记 | `# >>> dev-backup >>>` | `# >>> cold-backup >>>` |
+| launchd label 模板 | `com.dev-backup.daily` | `com.cold-backup.daily` |
+
+**下游要做的事**：前缀匹配 schema 的改成 `cold-backup.status/`；读日志目录的换新路径；
+传环境变量的换 `COLD_BACKUP_*`。旧 npm 包（`dev-backup`、`dsh-dev-backup`）已在 registry 上
+deprecate —— 旧版本仍能安装，只是会提示改名；GitHub 旧仓库名 301 重定向到新仓库。
+
+**已有数据怎么迁**（都不影响正确性，不做也不会丢东西）：
+
+```sh
+# 日志与状态文件：搬过去，历史判定（last-ok / last-failure）就还在
+mv ~/Library/Logs/dev-backup ~/Library/Logs/cold-backup     # Linux: ~/.local/state/...
+# 配置文件
+mv ~/.config/dev-backup ~/.config/cold-backup
+# 备份目录里的归属标记（不改也安全：没有标记一律按「大概是自己的」处理，见 §4）
+find "$DEST" -name .dev-backup-owner -execdir mv {} .cold-backup-owner \;
+# 定时任务：先用旧版卸掉再装新版，否则两份任务各跑各的
+dev-backup schedule uninstall && cold-backup schedule install
+```
+
+**注意旧任务不会被自动接管**：旧 crontab 标记与旧 launchd label 都不在新版本的识别范围内，
+不手工卸载就会每天跑两次（其中一次写的是旧路径）。这是「干净断代」的直接代价。

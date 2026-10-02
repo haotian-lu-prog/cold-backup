@@ -12,7 +12,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 FROZEN="20260101T000000Z"
-SHIM="$(mktemp -d "${TMPDIR:-/tmp}/dev-backup-frozen.XXXXXX")" || exit 2
+SHIM="$(mktemp -d "${TMPDIR:-/tmp}/cold-backup-frozen.XXXXXX")" || exit 2
 trap 'rm -rf "$SHIM"' EXIT
 
 # 只拦截引擎生成产物名用的那一种调用形态；其他（epoch 秒、人读时间）原样透传。
