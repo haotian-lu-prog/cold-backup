@@ -204,12 +204,17 @@ dev-backup schedule install --program /path/to/已授权的可执行文件
 ## 测试
 
 ```sh
-npm test          # = bash test/lint.sh && bash test/selftest.sh
+npm test            # = bash test/lint.sh && bash test/selftest.sh
+npm run test:frozen # 冻结时钟压力测试：把产物时间戳钉成同一个值再跑一遍
 ```
 
 自测全程只在 `mktemp -d` 造的临时工作区里操作，**不碰真实备份目录**。静态检查会拦
 「bash 3.2 会把全角字符吃进变量名」这类本机踩过的坑、bash 4 专有语法、版本号不一致、
 以及误入仓库的个人路径。
+
+`npm run test:frozen` 是专门的**并列**压力测试：产物名里的 UTC 时间戳只有秒精度，
+真实机器上「同一秒内为两个提交各备一次」是时序巧合（快的机器会撞上），冻结时钟把那巧合变成常态，
+用来保证轮转不会删掉刚写出的产物、校验与还原演练也不会抓错那一份。
 
 ## 许可证
 

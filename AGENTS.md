@@ -8,6 +8,7 @@
 - 安装依赖：**没有依赖**（需要 `bash` 3.2+、`git`、`tar`、`gzip`、`shasum` 或 `sha256sum`）
 - 测试：`npm test`（= `bash test/lint.sh && bash test/selftest.sh`）
 - 单跑静态检查：`bash test/lint.sh`；单跑端到端：`bash test/selftest.sh`
+- 并列压力测试：`npm run test:frozen`（冻结产物时间戳，制造「同一秒内两个提交」的极端情况）
 - 本地装一份试用：`./install.sh`（装到 `~/.local/bin`）
 
 自测全程只在 `mktemp -d` 造的临时目录里操作，**不会碰真实备份目录**；唯一的例外是
@@ -39,6 +40,7 @@ macOS 上会读 `~/Library/Logs/dev-backup/` 之类的默认路径（只读）�
 - `install.sh` — 不用 npm 时的安装脚本
 - `test/lint.sh` — 静态检查（bash 3.2 兼容、契约常量、版本号一致、无个人路径、CLI 冒烟）
 - `test/selftest.sh` — 端到端自测（临时工作区里跑完备份→校验→还原演练→清理）
+- `test/frozen-clock.sh` — 冻结时钟压力测试（同秒并列成为常态；CI 两个平台都跑）
 - `docs/compatibility.md` — 给下游消费者的契约
 - `docs/scheduling.md` — launchd / cron 安装与 macOS TCC 坑
 - `docs/restore.md` — 还原手册与「什么还原不回来」

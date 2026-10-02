@@ -16,7 +16,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 [ -f "$BIN" ] || { printf '✗ 找不到 %s\n' "$BIN" >&2; exit 2; }
 
 hdr "1 语法"
-for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh; do
+for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
   [ -f "$ROOT/$f" ] || { no "缺文件：$f"; continue; }
   if out="$(bash -n "$ROOT/$f" 2>&1)"; then ok "$f 语法通过"; else no "$f 语法错误：$out"; fi
 done
@@ -45,7 +45,7 @@ multibyte_lint() { # $1=文件
 
 if have perl; then
   mb_hits=""
-  for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh; do
+  for f in bin/dev-backup install.sh test/lint.sh test/selftest.sh test/frozen-clock.sh; do
     [ -f "$ROOT/$f" ] || continue
     h="$(multibyte_lint "$ROOT/$f")"
     [ -n "$h" ] && mb_hits="${mb_hits}${h}
@@ -55,7 +55,7 @@ if have perl; then
     no "变量后紧跟全角字符（bash 3.2 会把全角吃进变量名，必须写 \${var}）："
     printf '%s' "$mb_hits" | head -5
   else
-    ok "没有「变量后紧跟全角字符」的写法（4 个脚本都查了）"
+    ok "没有「变量后紧跟全角字符」的写法（5 个脚本都查了）"
   fi
 else
   printf '   - 跳过：没有 perl，无法查「变量后紧跟全角字符」\n'
