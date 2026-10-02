@@ -4,9 +4,10 @@
 
 ## 当前写者
 
-- 工具：DSH（2026-10-02 晚）—— **改名进行中**
+- 工具：（空 —— 2026-10-02 DSH 会话已收工：**改名 `dev-backup` → `cold-backup` 已完成并发布**；
+  新包名的 trusted publishing 待配）
 - 分支：main
-- 开始时间：2026-10-02 22:15 (+09:00)
+- 开始时间：—
 - 本轮：**改名** —— 引擎 CLI `dev-backup` → **`cold-backup`**，与 DSH 插件
   `dsh-dev-backup` → `dsh-cold-backup` 同步：包名、可执行文件 `bin/cold-backup`、
   环境变量前缀 `DEV_BACKUP_*` → `COLD_BACKUP_*`、默认目录 `~/Library/Logs/cold-backup`（Linux
