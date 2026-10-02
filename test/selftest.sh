@@ -173,23 +173,32 @@ run
 eq "再次重跑仍不新增（指纹在文件名里）" "$(nf "$DEV_BACKUP_DEST/snapshots/scratch" '*.tar.gz')" "$cases"
 
 hdr "7 损坏自愈三态"
+# ⚠️ 这里必须按**当前提交**挑产物，不能用「按文件名取最新」。
+# 为什么：产物名是 `<标签>-<UTC 秒>-<提交前12位>`，同一秒内为两个提交各备一次时，
+# 秒相同、只剩 sha 后缀可比 —— 「取最新」就退化成按 sha 随机排，可能挑到**旧提交**的产物。
+# 那时自愈不会发生（备份只为 HEAD 重建），--verify 会一直红。
+# 实测：ubuntu runner 够快，一个自测里连续提交+备份真的会落在同一秒（macOS 较慢所以没撞上），
+# CI 上因此红过一次。判据要落在「HEAD 这一份」上，别落在文件名的排序上。
+head_bundle() { ls -1 "$DEV_BACKUP_DEST/repos/demo"/*-"$1".bundle 2>/dev/null | sort | tail -1; }
+HSHORT="$(git -C "$R" rev-parse --short=12 HEAD)"
 # 7a「尾部垃圾 + sidecar 不匹配」：这种 git bundle verify 抓不到，只有真 clone 才能发现
-b="$(ls -1 "$DEV_BACKUP_DEST/repos/demo"/*.bundle | sort | tail -1)"
+b="$(head_bundle "$HSHORT")"
+[ -n "$b" ] || no "7a 用例本身失效：找不到 HEAD（${HSHORT}）的 bundle"
 printf 'x' >>"$b"
 "$BIN" --verify >/dev/null 2>&1; eq "--verify 对「尾部垃圾」bundle 的退出码" "$?" "1"
 run
 "$BIN" --verify >/dev/null 2>&1; eq "重跑后自愈，--verify 退出码" "$?" "0"
 eq "自愈后 bundle 个数（KEEP=2）" "$(nf "$DEV_BACKUP_DEST/repos/demo" '*.bundle')" "2"
 # 7b「sidecar 缺失 + 内容损坏」：缺失的 sidecar 绝不能被当成「通过」
-b="$(ls -1 "$DEV_BACKUP_DEST/repos/demo"/*.bundle | sort | tail -1)"
+b="$(head_bundle "$HSHORT")"
 printf 'x' >>"$b"; rm -f "$b.sha256"
 "$BIN" --verify >/dev/null 2>&1; eq "--verify 对「无 sidecar + 损坏」的退出码" "$?" "1"
 run
-b="$(ls -1 "$DEV_BACKUP_DEST/repos/demo"/*.bundle | sort | tail -1)"
+b="$(head_bundle "$HSHORT")"
 [ -f "$b.sha256" ] && ok "重跑后重建了产物并补回 .sha256" || no "重跑后 .sha256 仍缺失"
 # 7c 同一提交有两份产物、坏的是**最新**那份：自愈必须扫描全部匹配文件，不能只看第一个
 bdir="$DEV_BACKUP_DEST/repos/demo"
-hshort="$(git -C "$R" rev-parse --short=12 HEAD)"
+hshort="$HSHORT"
 good="$(ls -1 "$bdir"/*-"$hshort".bundle 2>/dev/null | head -1)"
 if [ -n "$good" ]; then
   cp "$good" "$bdir/demo-29990101T000000Z-$hshort.bundle"
@@ -203,6 +212,14 @@ else
   no "7c 用例本身失效：找不到 HEAD 的 bundle"
 fi
 "$BIN" --verify >/dev/null 2>&1; eq "重建后 --verify 退出码" "$?" "0"
+# 7d 同一秒的两个提交会产生「秒相同、只差 sha 后缀」的并列产物 —— 此时「按名取最新」是不可判定的。
+# 上面 7a/7b 因此改成按 HEAD 的 sha 挑；这里钉住产品侧真正重要的性质：
+# **`--status` 的判据是 HEAD 的 sha，与文件名排序无关**（并列产物不该影响它）。
+b="$(head_bundle "$HSHORT")"
+twin="${b%-"$HSHORT".bundle}999999999999.bundle"
+cp "$b" "$twin"
+"$BIN" --status >/dev/null 2>&1; eq "并列产物存在时 --status 仍判 HEAD 已备份" "$?" "0"
+rm -f "$twin"
 
 hdr "8 失败信号（last-failure + 日志 + --status 如实报告）"
 rm -f "$DEV_BACKUP_LOGDIR/last-failure"

@@ -114,6 +114,10 @@
 
 产物目录布局见 [README](../README.md#产物布局与还原)。其中：
 
+- 产物名里的 UTC 时间戳只有**秒**精度。同一秒内为两个不同提交各备一次时，会出现
+  「秒相同、只差 sha 后缀」的**并列**产物 —— 此时「按文件名取最新」是不可判定的，
+  消费方**不要**依赖并列时的顺序。（工具自己也不依赖：`--status` 判断的是「**HEAD 的 sha**
+  那一份在不在」，不是「文件名最大的那份」。）
 - `<DEST>/repos|snapshots|configs/<标签>/.dev-backup-owner` —— 归属标记，内容是工作区 ID。
   **不是**产物，不要当产物校验，也不要在没有把握时删它。
 - `<DEST>/manifests/*.tsv` —— 8 列 `epoch / kind / label / sha / count / file / bytes / sha256`。

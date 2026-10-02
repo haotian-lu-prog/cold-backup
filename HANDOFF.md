@@ -4,13 +4,14 @@
 
 ## 当前写者
 
-- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.1 两个防护 + 走 trusted publishing 首发验证**）
+- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.1 两个防护已发布**；trusted publishing 未匹配，待查）
 - 分支：main
 - 开始时间：—
 - 本轮：① 新增两个防护（都是 1.0.0 发布后实测出来的）：**`DEST` 不许落在工作区里**（会自我繁殖：
   快照把上一轮产物打进去，实测 3 轮 3194 → 6945 → 14110 字节）、**`schedule install --program`
-  不可执行时当场警告**（否则任务每天静默失败）。② 用 1.0.1 验证 trusted publishing：
-  Release → CI 直接发布、带 provenance，不再需要本机 npm 登录。
+  不可执行时当场警告**（否则任务每天静默失败）。② 试走 trusted publishing **失败**
+  （CI `PUT` 404，npm 侧配置未匹配），最终**用本机 token 发布 1.0.1（无 provenance）**；
+  排查线索与待办见「未决问题」。
 
 > 一个仓库同一时刻只允许一个写者。交接时把上一行改成自己，并先读完下面的状态。
 
@@ -71,7 +72,10 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 - **`schedule install --program <不可执行>` → 当场警告**（`--dry-run` 也警告）。只警告不失败 ——
   「先装任务、稍后再构建程序」是合理用法，但「每天静默失败」必须说出来。
 - 自测 **210 项 / 0 失败 / 0 跳过**（新增第 25 节 9 项断言）；`test/lint.sh` 37 项。
-- 1.0.1 走 **trusted publishing** 发布（不进 staging、带 provenance），见「下一步」第一条。
+- 1.0.1 的发布方式：**本机 `npm publish`（无 provenance）**。CI 那条路（Release → trusted
+  publishing）这次没走通，原因见「未决问题」；`dist-tags.latest = 1.0.1`，registry `dist.shasum`
+  `29bc71770dd49cab53e5b264f99a0552980143cc`。Release asset 已按老规矩对齐成 registry 那一份
+  （sha256 `37f780d227e6828aff1d4363c4d2a5357b879347dd9607653ced84662e3cde4d`，47432 字节）。
 
 **CI**：两个平台都跑通了 —— `ubuntu-latest` 16s、`macos-latest` 1m17s（后者再用 `/bin/bash` 3.2
 复跑一遍）。Linux 的 GNU 兼容层由此第一次得到真实验证（本机没有 Linux 环境，只有 CI）。
@@ -81,9 +85,19 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
-- [x] ~~**给 npm 配 trusted publishing**~~ → **用户已在 npm 侧配好**（2026-10-02），
-      并由 **1.0.1** 走通：GitHub Release → `publish.yml` → 直接发布、带 provenance，无需本机 npm 登录。
-      以后发版就是「bump version → tag → Release」三步。
+- [ ] **trusted publishing 没匹配上，待查**（用户已在 npm 侧建过配置）：CI 的 `publish.yml` 跑到
+      `npm publish` 那步报 `E404 PUT https://registry.npmjs.org/dev-backup`（npm 用 404 表示
+      「不匹配 / 无权限」）。工作流本身与**已能成功发布**的 `dsh-dev-backup` 那份结构一致
+      （`id-token: write`、无 `environment:`、`node-version: 24`、同样的 `npm publish` 命令），
+      所以问题在 npm 侧那四项。按可能性排序逐一核对：
+      1. **allowed actions 那一档**：若选的是「stage publish only」（默认），直接 `npm publish` 会被拒 ——
+         这与症状最吻合（`dsh-dev-backup` 当初也是这样，改成 allow publish 后 1.1.1 才直接发出去）；
+      2. **Environment** 必须**留空**（本工作流没有声明 `environment:`）；
+      3. **Workflow filename** 必须是 `publish.yml`（不是 `.github/workflows/publish.yml`）；
+      4. **Repository** 必须是 `dev-backup`（不带 owner 前缀）。
+      核对完重跑失败的那次即可：`gh run rerun 37001740529 --failed`（工作流幂等，1.0.1 已在 registry 上，
+      重跑会走到「已发布 → 跳过发布」；所以真要验证得等下一个版本，或先用一个 patch 版试）。
+      本机 token 读不到该配置：`npm trust list dev-backup` 返回 403（需带 2FA 的会话）。
 - [ ] 用一段时间后，再评估要不要把**本机**冷备切到这个 CLI（本次用户明确决定保持现状，
       接口与产物契约没变，切换成本已被压到一个 5 行薄壳）。
 - [ ] 若切换：`_shared/bin/backup-dev.sh` 换成 `exec dev-backup --config ~/dev/_shared/backup-dev.conf "$@"`，
@@ -97,6 +111,9 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 未决问题
 
+- **npm trusted publishing（本包）尚未生效**：CI 的 `npm publish` 报 `PUT` 404，排查清单见
+  「下一步」第一条。在它修好之前，发版必须走本机 `npm publish`（**无 provenance**）——
+  1.0.1 就是这么发的。
 - **`_shared` 的两个静默失效点已在 2026-10-02 修掉**（`_shared@697fef2`）：
   `git-hooks/post-commit` 找不到脚本时不再静默 `exit 0`（改为每次提交打印警告，仍 exit 0）；
   `audit.sh` 的「缺备份脚本」从提醒升级为错误。**两处都已实测**（缺脚本→有警告且 rc=0；
