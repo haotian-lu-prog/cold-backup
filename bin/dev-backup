@@ -1,0 +1,1569 @@
+#!/usr/bin/env bash
+# dev-backup —— 把「一个装着很多 git 仓库的工作区」冷备到一个目录
+#
+# 产物直接落进你指定的备份目录（OneDrive / iCloud / Dropbox 的同步目录，或任意磁盘），
+# 由同步客户端负责上传；不依赖 rclone / restic。
+#   <DEST>/repos/<标签>/<标签>-<UTC时间戳>-<提交前12位>.bundle      完整 git 历史（含 tags/stash）
+#   <DEST>/snapshots/<标签>/<标签>-<UTC时间戳>-<内容指纹>.tar.gz   非 git 顶层目录的快照
+#   <DEST>/configs/<标签>/<标签>-<UTC时间戳>-<内容指纹>.tar.gz     工具配置白名单（可选）
+#   <DEST>/manifests/<UTC时间戳>-<触发源>.tsv                      每次运行一份不可变清单
+#   <DEST>/README.md                                               还原说明（写给人看）
+# 备份目录里只有**不可变**内容：只新增 / 删除，绝不原地改已有文件。
+#
+# 用法：
+#   dev-backup                        跑一次备份（幂等：同一提交不重复打包）
+#   dev-backup --status               新鲜度 + 上传状态；有问题时退出 1
+#   dev-backup --status --json        同上，但输出 dev-backup.status/1 JSON
+#   dev-backup --verify [--fix]       逐份校验全部产物；--fix 顺手删掉损坏的
+#   dev-backup --daily                每日巡检：补跑备份 + 逐份校验 + 状态检查
+#   dev-backup --prune-orphans [--apply]   清理备份目录里已不对应任何目标的残留（默认只列）
+#   dev-backup --restore-drill [目录] 真还原演练：镜像 clone 每个最新 bundle，比对 ref 与提交数
+#   dev-backup schedule install|uninstall|status [--dry-run]
+#                                     装/卸/查定时任务（macOS 用 launchd，其他用 cron）
+#   dev-backup --init [--force]       写一份配置文件模板
+#   dev-backup --version
+#
+# 配置优先级：命令行 > 环境变量（DEV_BACKUP_* / DEV_ROOT）> 配置文件 > 内置默认。
+# 配置文件默认 `~/.config/dev-backup/config`（KEY=VALUE，见 --init 生成的模板）。
+# 退出码：0 = 一切正常；1 = 有问题；2 = 用法或配置错误。
+set -uo pipefail
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  printf 'dev-backup 需要 bash（当前不是 bash 在跑）。\n' >&2
+  exit 2
+fi
+
+VERSION="1.0.0"
+SCHEMA="dev-backup.status/1"
+PROG="${DEV_BACKUP_PROG:-$(basename "$0")}"
+SELF="$0"
+case "$SELF" in /*) ;; *) SELF="$(cd "$(dirname "$SELF")" && pwd -P)/$(basename "$SELF")" ;; esac
+
+# ── 跨平台兼容层 ─────────────────────────────────────────────────────────────
+# 原先直接写 BSD 的 `stat -f%z` / `date -j -f` / `shasum`，在 Linux 上会**静默算错**
+# （stat 报错被 `|| echo 0` 吞掉，字节数变 0）——所以统一收口成这几个函数。
+UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
+IS_DARWIN=0; [ "$UNAME_S" = "Darwin" ] && IS_DARWIN=1
+
+file_size()  { # $1=文件；拿不到就空
+  if [ "$IS_DARWIN" = "1" ]; then stat -f%z "$1" 2>/dev/null; else stat -c%s "$1" 2>/dev/null; fi
+}
+file_mtime() {
+  if [ "$IS_DARWIN" = "1" ]; then stat -f%m "$1" 2>/dev/null; else stat -c%Y "$1" 2>/dev/null; fi
+}
+file_mode_ok() { [ -r "$1" ]; }
+
+sha256_file() { # $1=文件
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  else return 1; fi
+}
+sha256_stdin() {
+  if command -v shasum >/dev/null 2>&1; then shasum -a 256 2>/dev/null | cut -d' ' -f1
+  elif command -v sha256sum >/dev/null 2>&1; then sha256sum 2>/dev/null | cut -d' ' -f1
+  else return 1; fi
+}
+stamp_to_epoch() { # $1=YYYYmmddTHHMMSSZ
+  local s="$1"
+  if [ "$IS_DARWIN" = "1" ]; then
+    TZ=UTC date -j -f '%Y%m%dT%H%M%SZ' "$s" +%s 2>/dev/null
+  else
+    TZ=UTC date -d "${s:0:4}-${s:4:2}-${s:6:2} ${s:9:2}:${s:10:2}:${s:12:2}" +%s 2>/dev/null
+  fi
+}
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# launchd / cron 的 PATH 往往只有 /usr/bin:/bin：只**追加**常见位置，绝不覆盖用户 PATH
+for _p in /opt/homebrew/bin /usr/local/bin; do
+  case ":$PATH:" in *":$_p:"*) ;; *) [ -d "$_p" ] && PATH="$PATH:$_p" ;; esac
+done
+unset _p
+
+# ── 参数 ─────────────────────────────────────────────────────────────────────
+MODE="backup"
+TRIGGER="manual"
+DRILL_DIR_OPT=""
+VERIFY_REPO=""
+RUN_MANIFEST=""
+JSON_OUT=0
+APPLY=0
+FIX=0
+SOFT_FAIL=0
+FORCE=0
+DRY_RUN=0
+OPT_CONFIG=""
+OPT_ROOT=""
+OPT_DEST=""
+OPT_LOGDIR=""
+SCHED_ACTION="status"
+SCHED_KIND=""
+SCHED_PROGRAM=""
+SCHED_LABEL=""
+SCHED_AT="12:00"
+
+if [ "${1:-}" = "schedule" ]; then
+  MODE="schedule"; shift
+  if [ $# -gt 0 ]; then case "$1" in -*) ;; *) SCHED_ACTION="$1"; shift ;; esac; fi
+fi
+
+usage() { sed -n '2,31p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    # `schedule` 出现在哪个位置都行：`dev-backup schedule install --at 7:00` 与
+    # `dev-backup --kind cron schedule install --at 7:00` 都要能用（后者一开始被当成未知参数）。
+    schedule)
+      MODE="schedule"; shift
+      if [ $# -gt 0 ]; then case "$1" in -*) ;; *) SCHED_ACTION="$1"; shift ;; esac; fi
+      continue ;;
+    --status)        MODE="status" ;;
+    --json)          JSON_OUT=1 ;;
+    --verify)        MODE="verify" ;;
+    --daily)         MODE="daily" ;;
+    --prune-orphans) MODE="prune-orphans" ;;
+    --apply)         APPLY=1 ;;
+    --fix)           FIX=1 ;;
+    --restore-drill)
+      MODE="drill"
+      if [ $# -ge 2 ] && [ "${2#--}" = "$2" ]; then DRILL_DIR_OPT="$2"; shift; fi
+      ;;
+    --trigger=*)     TRIGGER="${1#*=}" ;;
+    --config)        OPT_CONFIG="${2:-}"; shift ;;
+    --config=*)      OPT_CONFIG="${1#*=}" ;;
+    --root)          OPT_ROOT="${2:-}"; shift ;;
+    --root=*)        OPT_ROOT="${1#*=}" ;;
+    --dest)          OPT_DEST="${2:-}"; shift ;;
+    --dest=*)        OPT_DEST="${1#*=}" ;;
+    --logdir)        OPT_LOGDIR="${2:-}"; shift ;;
+    --logdir=*)      OPT_LOGDIR="${1#*=}" ;;
+    --init)          MODE="init" ;;
+    --version|-V)    MODE="version" ;;
+    --force)         FORCE=1 ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --kind)          SCHED_KIND="${2:-}"; shift ;;
+    --kind=*)        SCHED_KIND="${1#*=}" ;;
+    --program)       SCHED_PROGRAM="${2:-}"; shift ;;
+    --program=*)     SCHED_PROGRAM="${1#*=}" ;;
+    --label)         SCHED_LABEL="${2:-}"; shift ;;
+    --label=*)       SCHED_LABEL="${1#*=}" ;;
+    --at)            SCHED_AT="${2:-}"; shift ;;
+    --at=*)          SCHED_AT="${1#*=}" ;;
+    -h|--help)       usage; exit 0 ;;
+    *) printf '未知参数：%s（--help 看用法）\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# ── 配置文件 ─────────────────────────────────────────────────────────────────
+config_lines() { # 把配置文件规范化成「KEY=VALUE」多行，供测试与 --init 复用
+  [ -n "${1:-}" ] && [ -f "$1" ] || return 0
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" \
+    | grep -v '^#' | grep -v '^$'
+}
+
+conf_raw() { # $1=键；取最后一次出现的值
+  [ -n "$CONF_FILE" ] && [ -f "$CONF_FILE" ] || return 0
+  local line
+  line="$(sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$CONF_FILE" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || return 0
+  # 行尾注释：只有 `#` 前有空白才算（值里可能含 #）
+  line="$(printf '%s' "$line" | sed 's/[[:space:]]#.*$//')"
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+  printf '%s' "$line"
+}
+
+conf_value() { # $1=短名 $2=全名（如 DEV_BACKUP_DEST）
+  local v
+  v="$(conf_raw "$1")"
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  [ -n "${2:-}" ] && conf_raw "$2"
+}
+
+expand_path() { # 展开 ~ 与前缀 $HOME；配置/环境变量里写字面量路径时都用得到
+  local p="$1"
+  case "$p" in
+    "~")     p="$HOME" ;;
+    "~/"*)   p="$HOME/${p#\~/}" ;;
+  esac
+  case "$p" in
+    '$HOME'*)  p="$HOME${p#\$HOME}" ;;
+    '${HOME}'*) p="$HOME${p#\$\{HOME\}}" ;;
+  esac
+  printf '%s' "$p"
+}
+
+# 解析一项：命令行 > 环境变量 > 配置文件（短名或全名） > 默认
+cfg() { # $1=env 名 $2=配置短名 $3=命令行值 $4=默认值
+  local v
+  if [ -n "$3" ]; then printf '%s' "$(expand_path "$3")"; return 0; fi
+  eval "v=\${$1:-}"
+  if [ -z "$v" ]; then v="$(conf_value "$2" "$1")"; fi
+  [ -n "$v" ] || v="$4"
+  printf '%s' "$(expand_path "$v")"
+}
+
+# 配置文件位置：--config > DEV_BACKUP_CONFIG > XDG 默认
+if [ -n "$OPT_CONFIG" ]; then
+  CONF_FILE="$(expand_path "$OPT_CONFIG")"
+  # 显式指了文件却不存在 → 明确报错（别静默用默认值干活）。但 `--init` 就是来**创建**它的。
+  if [ "$MODE" != "init" ] && [ ! -f "$CONF_FILE" ]; then
+    printf '配置文件不存在：%s\n' "$CONF_FILE" >&2
+    exit 2
+  fi
+else
+  CONF_FILE="$(expand_path "${DEV_BACKUP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/dev-backup/config}")"
+fi
+
+# ── 配置项 ───────────────────────────────────────────────────────────────────
+DEV_ROOT="$(cfg DEV_ROOT ROOT "$OPT_ROOT" "$HOME/dev")"
+DEST="$(cfg DEV_BACKUP_DEST DEST "$OPT_DEST" "")"
+if [ -n "$OPT_LOGDIR" ]; then
+  LOG_DIR="$(expand_path "$OPT_LOGDIR")"
+else
+  LOG_DIR="$(cfg DEV_BACKUP_LOGDIR LOGDIR "" "")"
+  if [ -z "$LOG_DIR" ]; then
+    if [ "$IS_DARWIN" = "1" ]; then LOG_DIR="$HOME/Library/Logs/dev-backup"
+    else LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dev-backup"; fi
+  fi
+fi
+KEEP="$(cfg DEV_BACKUP_KEEP KEEP "" 10)"
+LOCK_WAIT="$(cfg DEV_BACKUP_LOCK_WAIT LOCK_WAIT "" 600)"
+DEPTH="$(cfg DEV_BACKUP_DEPTH DEPTH "" 3)"
+DO_SNAPSHOTS="$(cfg DEV_BACKUP_SNAPSHOTS SNAPSHOTS "" 1)"
+INCLUDE_ENV="$(cfg DEV_BACKUP_INCLUDE_ENV INCLUDE_ENV "" 0)"
+NO_NOTIFY="$(cfg DEV_BACKUP_NO_NOTIFY NO_NOTIFY "" 0)"
+NOTIFY_TITLE="$(cfg DEV_BACKUP_NOTIFY_TITLE NOTIFY_TITLE "" "dev-backup（工作区冷备）")"
+UPLOAD_GRACE="$(cfg DEV_BACKUP_UPLOAD_GRACE UPLOAD_GRACE "" 600)"
+EXCLUDES="$(cfg DEV_BACKUP_EXCLUDES EXCLUDES "" "")"
+DRILL_BASE="$(cfg DEV_BACKUP_DRILL_DIR DRILL_DIR "" "")"
+FDA_APP="$(cfg DEV_BACKUP_FDA_APP FDA_APP "" "")"
+CONFIGS_SPEC="$(cfg DEV_BACKUP_CONFIGS CONFIGS "" "off")"
+SCHED_LABEL="$(cfg DEV_BACKUP_LABEL LABEL "$SCHED_LABEL" "com.dev-backup.daily")"
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG="$LOG_DIR/backup.log"
+LOCK="$LOG_DIR/.lock"
+TMP="$LOG_DIR/tmp"
+
+# 归属标记：备份目录里每个目标目录放一份 `.dev-backup-owner`，内容是「工作区 ID」。
+# 为什么需要它：两个工作区（或两台机器）指向**同一个备份目录**时，标签可能撞名，
+# 彼此的产物会被对方的 --prune-orphans 当成「残留」删掉 —— 那是数据丢失，不是清理。
+# 默认 ID = 主机名 + 工作区根路径的指纹；同一台机器搬目录后 ID 会变，用 WORKSPACE_ID 固定。
+OWNER_FILE=".dev-backup-owner"
+WS_ID="$(cfg DEV_BACKUP_WORKSPACE_ID WORKSPACE_ID "" "")"
+if [ -z "$WS_ID" ]; then
+  WS_ID="$(printf '%s\n%s\n' "$(hostname 2>/dev/null || echo unknown-host)" "$DEV_ROOT" | sha256_stdin | cut -c1-12)"
+fi
+
+owner_mark() { # $1=目标目录：写归属标记（内容变了才写，保持「只新增不改动」的精神）
+  local f="$1/$OWNER_FILE"
+  mkdir -p "$1" 2>/dev/null
+  [ -f "$f" ] && [ "$(tr -d ' \n' <"$f" 2>/dev/null)" = "$WS_ID" ] && return 0
+  printf '%s\n' "$WS_ID" >"$f" 2>/dev/null
+}
+
+owner_class() { # $1=相对路径（如 repos/demo）→ ours | unowned | foreign
+  local f="$DEST/$1/$OWNER_FILE" id
+  [ -f "$f" ] || { printf 'unowned'; return 0; }
+  id="$(tr -d ' \n' <"$f" 2>/dev/null)"
+  [ -n "$id" ] || { printf 'unowned'; return 0; }
+  [ "$id" = "$WS_ID" ] && printf 'ours' || printf 'foreign'
+}
+
+# 没配 DEST 时能不能干活：备份/校验/演练不能，--status 要输出「未配置」这个事实。
+require_dest() {
+  [ -n "$DEST" ] && return 0
+  printf '还没有配置备份目标（DEST）。\n  跑 `%s --init` 生成配置文件模板，或设环境变量 DEV_BACKUP_DEST。\n' "$PROG" >&2
+  exit 2
+}
+
+if [ -n "${DEV_BACKUP_DISABLE:-}" ] && [ "$DEV_BACKUP_DISABLE" = "1" ] && [ "$MODE" = "backup" ]; then
+  exit 0
+fi
+
+# --json 是 --status 的修饰符；单独写 `--json` 按 `--status --json` 理解（省一次敲键盘）。
+# 配别的模式没有意义 —— 明确报错，不静默忽略。
+if [ "$JSON_OUT" = "1" ]; then
+  case "$MODE" in
+    backup) MODE="status" ;;
+    status) : ;;
+    *) printf -- '--json 只能配合 --status 使用（当前模式：%s）\n' "$MODE" >&2; exit 2 ;;
+  esac
+fi
+
+# ── 基础设施 ─────────────────────────────────────────────────────────────────
+# 只读模式（--status / --version）严格只读：不建目录、不动日志。
+# 否则「看一眼状态」会在只读文件系统上失败，也会凭空产生副作用。
+case "$MODE" in
+  status|version) ;;
+  *)
+    mkdir -p "$LOG_DIR" "$TMP" 2>/dev/null
+    if [ -f "$LOG" ] && [ "$(wc -c <"$LOG" | tr -d ' ')" -gt 1048576 ]; then
+      mv -f "$LOG" "$LOG.1" 2>/dev/null
+    fi
+    ;;
+esac
+
+ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+log() { printf '[%s] (%s) %s\n' "$(ts)" "$TRIGGER" "$*" >>"$LOG" 2>/dev/null; }
+out() { printf '%s\n' "$*"; }
+
+notify() {
+  [ "$NO_NOTIFY" = "1" ] && return 0
+  if have osascript; then
+    osascript -e "display notification \"${1//\"/}\" with title \"${NOTIFY_TITLE//\"/}\"" >/dev/null 2>&1 || true
+  elif have notify-send; then
+    notify-send "$NOTIFY_TITLE" "$1" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+die() {
+  log "失败：$*"
+  # last-failure 的语义是「上次**备份**失败了」。--status 等只读模式出问题不该写它，
+  # 否则「看一眼状态」（比如机器上没装 git）会污染下一轮判定的输入。
+  case "$MODE" in
+    backup|daily) printf 'epoch=%s\ttrigger=%s\t%s\n' "$(date +%s)" "$TRIGGER" "$*" >>"$LOG_DIR/last-failure" 2>/dev/null ;;
+  esac
+  notify "失败：${*}"
+  out "✗ $*"
+  exit 1
+}
+
+# 备份锁：并发提交时后到的实例等锁，拿到锁后重新读 HEAD，避免漏掉新提交。
+# 等待上限默认 600s（备份耗时随仓库数与历史增长，等太短会把「备份期间提交」的那次饿死）。
+release_lock() { [ -n "${LOCK_HELD:-}" ] && rm -rf "$LOCK" 2>/dev/null; return 0; }
+
+# 异常退出（set -u 中止、被 kill…）也要有可见信号，且必须释放锁。
+on_exit() {
+  local rc=$?
+  release_lock
+  if [ "$rc" -ne 0 ] && [ "$MODE" = "backup" ] && [ ! -f "$LOG_DIR/last-failure" ]; then
+    log "异常退出 rc=${rc}（没走到 die：可能是 set -u 中止或被信号杀死）"
+    notify "异常退出 rc=${rc}（日志 ${LOG}）"
+  fi
+  return 0
+}
+trap on_exit EXIT
+
+acquire_lock() {
+  local waited=0 now lts
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    now="$(date +%s)"; lts="$(cat "$LOCK/ts" 2>/dev/null || echo 0)"
+    case "$lts" in ''|*[!0-9]*) lts=0 ;; esac
+    if [ $((now - lts)) -gt 900 ]; then
+      log "清理陈旧锁（>15 分钟）$LOCK"
+      rm -rf "$LOCK"
+      continue
+    fi
+    [ "$waited" -ge "$LOCK_WAIT" ] && return 1
+    sleep 1; waited=$((waited + 1))
+  done
+  date +%s >"$LOCK/ts" 2>/dev/null
+  printf '%s\n' "$$" >"$LOCK/pid" 2>/dev/null
+  LOCK_HELD=1
+  return 0
+}
+
+need_git() { have git || die "找不到 git"; }
+
+# git bundle verify 需要一个仓库上下文；用一个空的裸仓库来校验，
+# 这样「bundle 缺前置对象（thin bundle）」也会被发现，而不是被源仓库掩盖。
+ensure_verify_repo() {
+  VERIFY_REPO="$LOG_DIR/verify.git"
+  [ -d "$VERIFY_REPO" ] || git init -q --bare "$VERIFY_REPO" >>"$LOG" 2>&1 || die "无法创建校验用空仓库"
+}
+
+verify_bundle() { # $1=bundle 路径
+  git --git-dir="$VERIFY_REPO" bundle verify "$1" >>"$LOG" 2>&1
+}
+
+is_git_repo() { git -C "$1" rev-parse --git-dir >/dev/null 2>&1; }
+
+list_repos() { # 输出「仓库绝对路径<TAB>标签」；标签=相对路径，避免嵌套仓库与同名顶层目录撞名
+  find "$DEV_ROOT" -maxdepth "$DEPTH" -name .git \( -type d -o -type f \) -not -path '*/node_modules/*' 2>/dev/null | sort | while IFS= read -r g; do
+    r="$(dirname "$g")"
+    rel="${r#"$DEV_ROOT"/}"
+    # 隐藏路径（.worktrees/ 等）不单独打包：各分支 ref 本来就在主仓库的 bundle 里
+    case "$rel" in .*|*/.?*) continue ;; esac
+    printf '%s\t%s\n' "$r" "$rel"
+  done
+}
+
+# 按**文件名**取最新：文件名里是 UTC 时间戳，字典序即时间序。
+# 不能用 ls -1t（mtime）：云盘重新物化 / 元数据刷新会改写 mtime，会把「最新」判错，
+# 进而让 --status 误报落后、--verify 去验旧产物、--restore-drill 拿旧 bundle 演练。
+newest_of()     { ls -1 "$1"/$2 2>/dev/null | sort | tail -1; }
+newest_bundle() { newest_of "$1" '*.bundle'; }
+newest_snapshot() { newest_of "$1" '*.tar.gz'; }
+
+sidecar_ok() { # $1=产物；.sha256 存在且匹配才算通过。缺失 = 不可信，绝不是「通过」。
+  local f="$1" want got
+  [ -f "$f.sha256" ] || return 1
+  want="$(tr -d ' \n' <"$f.sha256" 2>/dev/null)"
+  got="$(sha256_file "$f")" || return 1
+  [ "$want" = "$got" ]
+}
+
+# macOS 隐私保护探测：`~/Library/CloudStorage/*` 是受保护的 FileProvider 域，没有「完全磁盘
+# 访问权限」的进程只能**新建**文件，读/改已有文件一律 EPERM。返回 0 表示「读不到已有内容」。
+#
+# 判据必须是「已存在的文件能不能读」，所以先找一个真实存在的产物来试。
+fda_blocked() {
+  [ -n "$DEST" ] || return 1
+  [ -d "$DEST" ] || return 1                  # 目录还不存在：没东西可读，谈不上被挡
+  # 症状里「看不到任何产物」说明连目录都可能列不出来，所以目录级也要试
+  ls -1 "$DEST" >/dev/null 2>&1 || return 0
+  local probe=""
+  probe="$(ls -1 "$DEST"/manifests/*.tsv 2>/dev/null | sort | tail -1)"
+  [ -n "$probe" ] || probe="$(ls -1 "$DEST"/repos/*/*.bundle 2>/dev/null | sort | tail -1)"
+  [ -n "$probe" ] || probe="$(ls -1 "$DEST"/snapshots/*/*.tar.gz 2>/dev/null | sort | tail -1)"
+  if [ -z "$probe" ] && [ -f "$DEST/README.md" ]; then probe="$DEST/README.md"; fi
+  [ -n "$probe" ] || return 1                 # 一份已有文件都没有：首次备份本来就该成功
+  [ -f "$probe" ] || return 1
+  head -c 1 "$probe" >/dev/null 2>&1 || return 0
+  return 1
+}
+
+fda_hint() { # 只在 macOS 的受保护目录上才谈授权；其他平台说清「读不到」即可
+  if [ "$IS_DARWIN" = "1" ]; then
+    local app="$FDA_APP"
+    [ -n "$app" ] || app="$(ls -d "$HOME/Applications/"*.app 2>/dev/null | head -1)"
+    printf '当前进程读不到 %s 里已有的产物（macOS 隐私保护）：若这是 launchd 任务，请在「系统设置 → 隐私与安全性 → 完全磁盘访问权限」里授权运行它的程序' "$DEST"
+    [ -n "$app" ] && printf '（例如 %s）' "$app"
+    printf '；在终端里手动运行不受影响。'
+  else
+    printf '当前进程读不到 %s 里已有的产物（权限或挂载问题）' "$DEST"
+  fi
+}
+
+# ── 备份 ────────────────────────────────────────────────────────────────────
+prune() { # $1=目录 $2=通配；保留最新 KEEP 个（按文件名排序，mtime 被云盘改写也不会删错）
+  local d="$1" pat="$2" n=0 f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n + 1))
+    [ "$n" -le "$KEEP" ] && continue
+    if rm -f "$f" "$f.sha256" 2>/dev/null; then
+      log "轮转删除 $(basename "$f")"
+    else
+      # 云盘里由别的进程创建的产物，后台任务可能删不掉（TCC）——别假装删成功了
+      log "轮转删除失败（权限？）：$(basename "$f")"
+    fi
+  done < <(ls -1 "$d"/$pat 2>/dev/null | sort -r)
+}
+
+# 每次运行的清单写成**新文件**（不可变），不追加到共享文件：
+# 1) 云盘同步对「只新增、不修改」最友好；2) 后台任务改不了别的进程建的已有文件。
+run_manifest_add() { printf '%s\n' "$1" >>"$RUN_MANIFEST" 2>/dev/null; }
+
+bundle_extra_refs() { # --all 不含 refs/stash，存在时必须显式带上，否则 stash 内容哪都没进
+  if git -C "$1" rev-parse --verify -q refs/stash >/dev/null 2>&1; then printf 'refs/stash'; fi
+}
+
+backup_repo() { # $1=仓库路径 $2=标签
+  local repo="$1" label="$2" sha short d final tmpf count bytes sum existing slug extra
+  sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  if [ -z "$sha" ]; then log "跳过 ${label}：还没有提交"; return 0; fi
+  short="${sha:0:12}"
+  slug="$(printf '%s' "$label" | tr '/' '_')"
+  d="$DEST/repos/$label"
+  owner_guard "repos/$label" "$label" || return 0
+  mkdir -p "$d" || die "无法创建 ${d}"
+  owner_mark "$d"
+  # 自愈：**扫描全部**匹配该提交的产物，而不是只看第一个。
+  # 旧写法 `ls | head -1` 假设「同一提交只有一份产物」——一旦存在第二份（历史重写、并发触发），
+  # 当坏的是最新那份时它会看到另一份完好的而跳过，坏的那份就永远留着了。
+  local intact="" f bad=0
+  for f in "$d"/*-"$short".bundle; do
+    [ -f "$f" ] || continue
+    if sidecar_ok "$f"; then
+      intact="$f"
+    else
+      bad=$((bad + 1))
+      if [ -f "$f.sha256" ]; then
+        log "已有 bundle 指纹不符（云盘同步损坏？），删除并重建：$(basename "$f")"
+      else
+        log "已有 bundle 缺 .sha256 指纹（不可信），删除并重建：$(basename "$f")"
+      fi
+      rm -f "$f" "$f.sha256"
+    fi
+  done
+  if [ -n "$intact" ]; then
+    [ "$bad" -gt 0 ] && log "已清掉 ${bad} 份损坏副本，保留完好的一份：$(basename "$intact")"
+    log "跳过 ${label}：提交 ${short} 已有完好 bundle"
+    return 0
+  fi
+  tmpf="$TMP/$slug-$STAMP-$short.bundle"
+  extra="$(bundle_extra_refs "$repo")"
+  if [ -n "$extra" ]; then
+    git -C "$repo" bundle create "$tmpf" --all "$extra" >>"$LOG" 2>&1 || die "打包失败：${label}"
+  else
+    git -C "$repo" bundle create "$tmpf" --all >>"$LOG" 2>&1 || die "打包失败：${label}"
+  fi
+  verify_bundle "$tmpf" || die "bundle 自检失败：${label}"
+  count="$(git -C "$repo" rev-list --count --all 2>/dev/null || echo '?')"
+  bytes="$(file_size "$tmpf")"; [ -n "$bytes" ] || bytes=0
+  final="$slug-$STAMP-$short.bundle"
+  cp -f "$tmpf" "$d/.$final.partial" && mv -f "$d/.$final.partial" "$d/$final" || die "写入失败：${final}"
+  rm -f "$tmpf"
+  sum="$(sha256_file "$d/$final")"
+  printf '%s\n' "$sum" >"$d/$final.sha256"
+  run_manifest_add "$(printf '%s\trepo\t%s\t%s\t%s\t%s\t%s\t%s' "$(date +%s)" "$label" "$sha" "$count" "$final" "$bytes" "$sum")"
+  log "备份 ${label}：${final}（$count 提交，$bytes 字节）"
+  out "  ✓ $label  →  ${final}（$count 提交，$bytes 字节）"
+  prune "$d" '*.bundle'
+}
+
+snapshot_excludes() {
+  printf '%s\n' '--exclude=.git' '--exclude=.DS_Store' '--exclude=node_modules' '--exclude=dist' '--exclude=build' \
+    '--exclude=out' '--exclude=.venv' '--exclude=__pycache__' '--exclude=.cache' '--exclude=tmp' \
+    '--exclude=*.log' '--exclude=*.tsbuildinfo' '--exclude=restore-drill*'
+  [ "$INCLUDE_ENV" = "1" ] || printf '%s\n' '--exclude=.env' '--exclude=.env.*'
+  # 追加用户自定义排除（空格或逗号分隔）
+  if [ -n "$EXCLUDES" ]; then
+    printf '%s' "$EXCLUDES" | tr ', ' '\n\n' | while IFS= read -r p; do
+      [ -n "$p" ] && printf -- '--exclude=%s\n' "$p"
+    done
+  fi
+}
+
+backup_snapshot() { # $1=顶层目录名
+  local label="$1" dir="$DEV_ROOT/$1" d final sum fp bytes tmpf newest
+  [ -d "$dir" ] || return 0
+  d="$DEST/snapshots/$label"
+  owner_guard "snapshots/$label" "$label" || return 0
+  mkdir -p "$d" || die "无法创建 ${d}"
+  owner_mark "$d"
+  local -a ex=()
+  while IFS= read -r p; do ex[${#ex[@]}]="$p"; done < <(snapshot_excludes)
+  tmpf="$TMP/$label-$STAMP.tar.gz"
+  tar "${ex[@]}" -cf - -C "$DEV_ROOT" "$label" 2>>"$LOG" | gzip -n >"$tmpf" || die "快照失败：${label}"
+  [ -s "$tmpf" ] || die "快照为空：${label}"
+  store_snapshot_file "$label" "$d" "$tmpf" snapshot
+}
+
+# 把已经打好的 tar.gz 落盘：指纹写进**文件名**（内容没变就什么都不写）、记清单、轮转。
+# 普通快照与配置快照共用这一段，避免两处各写一份去重逻辑。
+store_snapshot_file() { # $1=标签 $2=目标目录 $3=临时 tar.gz $4=类型（snapshot / config）
+  local label="$1" d="$2" tmpf="$3" kind="$4" sum fp newest final bytes
+  sum="$(gzip -dc "$tmpf" 2>/dev/null | sha256_stdin)"
+  fp="${sum:0:12}"
+  newest="$(newest_snapshot "$d")"
+  if [ -n "$newest" ]; then
+    case "$(basename "$newest")" in
+      *-"$fp".tar.gz)
+        rm -f "$tmpf"
+        log "跳过 ${label}：内容未变（$(basename "$newest")）"
+        return 0
+        ;;
+    esac
+  fi
+  final="$label-$STAMP-$fp.tar.gz"
+  cp -f "$tmpf" "$d/.$final.partial" && mv -f "$d/.$final.partial" "$d/$final" || { rm -f "$tmpf"; die "写入失败：${final}"; }
+  rm -f "$tmpf"
+  bytes="$(file_size "$d/$final")"; [ -n "$bytes" ] || bytes=0
+  run_manifest_add "$(printf '%s\t%s\t%s\t-\t-\t%s\t%s\t%s' "$(date +%s)" "$kind" "$label" "$final" "$bytes" "$sum")"
+  log "${kind} ${label}：${final}（${bytes} 字节）"
+  out "  ✓ $label  →  ${final}（${bytes} 字节）"
+  prune "$d" '*.tar.gz'
+}
+
+# ── 工具配置冷备（白名单，可选）──────────────────────────────────────────────
+# 为什么用白名单而不是「整个 home 排除几项」：这些 home 里有凭据（`auth.json`、
+# `.credentials.yaml`）、会话与历史（`sessions/`、`projects/`、`history.jsonl`）、
+# 以及可重装的大体积内容，还有**项目运行时目录**。白名单只收「设置 + 指令文件 +
+# profile/agent 定义」，要加东西必须显式写进来。
+# 格式：<标签>|<家目录>|<相对路径1>,<相对路径2>,...
+# 默认 off（不认识你的 home 长什么样，不猜）；用 CONFIGS 或 DEV_BACKUP_CONFIGS 显式打开。
+config_spec() {
+  [ "${CONFIGS_SPEC:-off}" = "off" ] && return 0
+  # 多条用 `;` 分隔：配置文件是「一行一个 KEY=VALUE」，写不了多行值
+  printf '%s' "$CONFIGS_SPEC" | tr ';' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | grep -v '^$'
+}
+config_targets() { # 输出「config<TAB>标签<TAB>家目录」
+  config_spec | while IFS='|' read -r label home _items; do
+    [ -n "${label:-}" ] || continue
+    printf 'config\t%s\t%s\n' "$label" "$home"
+  done
+}
+
+# 上云前预检：白名单文件里出现疑似密钥就**不收**（我们不做加密，先拦住比事后补救便宜）。
+# `sk-` 前必须锚词边界：`ask-codex-to-look-across-your` 这种路径里也含 "sk-"，不锚定会误报（实测踩过）。
+config_secret_scan() { # $1=家目录，其余=相对路径；有命中则打印并返回 1
+  local home="$1"; shift
+  local pat='(^|[^A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(api[_-]?key|apikey|token|password|secret)["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9_./+-]{20,}'
+  local -a present=() r
+  for r in "$@"; do [ -e "$home/$r" ] && present+=("$home/$r"); done
+  [ "${#present[@]}" -gt 0 ] || return 0
+  local hits
+  # 排除 node_modules：那是可重装的第三方代码，不是「配置」，
+  # 而它里面的普通字面量会撞上那条宽泛的 token/key 规则，把整份配置备份打成误报。
+  hits="$(grep -rInEI --exclude-dir=node_modules "$pat" "${present[@]}" 2>/dev/null | head -3)"
+  [ -z "$hits" ] && return 0
+  printf '%s\n' "$hits"
+  return 1
+}
+
+backup_config() { # $1=标签 $2=家目录 $3=逗号分隔的相对路径
+  local label="$1" home="$2" items_raw="$3" d tmpf oldifs r
+  [ -d "$home" ] || { log "跳过 ${label}：家目录不存在（${home}）"; return 0; }
+  local -a items=()
+  oldifs="$IFS"; IFS=','
+  for r in $items_raw; do [ -e "$home/$r" ] && items+=("$r"); done
+  IFS="$oldifs"
+  if [ "${#items[@]}" -eq 0 ]; then log "跳过 ${label}：白名单里的条目都不存在"; return 0; fi
+  d="$DEST/configs/$label"
+  owner_guard "configs/$label" "$label" || return 0
+  mkdir -p "$d" || die "无法创建 ${d}"
+  owner_mark "$d"
+  if ! config_secret_scan "$home" "${items[@]}" >>"$LOG" 2>&1; then
+    log "跳过 ${label}：白名单文件里有疑似密钥（不加密上云，先拦住；明细见上几行）"
+    out "  ✗ ${label}：检测到疑似密钥，已跳过（明细见日志）"
+    SOFT_FAIL=1
+    return 0
+  fi
+  tmpf="$TMP/$label-$STAMP.tar.gz"
+  # node_modules 不进配置快照：它是可重装的依赖，会凭空把几 KB 的配置撑大，而且里面的
+  # 第三方源码会把密钥预检打成误报（同 config_secret_scan）。两个 pattern 都要：
+  # `*/node_modules` 管嵌套，`node_modules` 管顶层。
+  tar -cf - -C "$home" --exclude='node_modules' --exclude='*/node_modules' \
+    "${items[@]}" 2>>"$LOG" | gzip -n >"$tmpf" || die "配置快照失败：${label}"
+  [ -s "$tmpf" ] || die "配置快照为空：${label}"
+  store_snapshot_file "$label" "$d" "$tmpf" config
+}
+
+write_readme() { # 说明文件：内容变了就刷新（否则备份目录里那份会一直是旧说明）
+  local tmp="$TMP/README.md.new"
+  cat >"$tmp" <<EOF
+# 冷备目录（由 \`dev-backup\` 生成）
+
+工作区根：\`$DEV_ROOT\`
+只放冷备产物，**不要**把活仓库、node_modules、构建产物搬进来。
+
+## 目录
+
+- \`repos/<标签>/<标签>-<UTC时间戳>-<提交前12位>.bundle\` —— 完整 git 历史（\`--all\` + 存在时的 \`refs/stash\`），每个提交最多一份；同名 \`.sha256\` 是它的指纹
+- \`snapshots/<标签>/<标签>-<UTC时间戳>-<内容指纹>.tar.gz\` —— 非 git 顶层目录的快照，**内容没变就不新增**（指纹在文件名里）
+- \`configs/<标签>/<标签>-<UTC时间戳>-<内容指纹>.tar.gz\` —— 显式配置的工具配置白名单（可选）
+- \`manifests/<UTC时间戳>-<触发源>.tsv\` —— 每次运行一份清单（时间戳 / 类型 / 标签 / 提交 / 提交数 / 文件 / 字节 / sha256）
+
+这里只有**不可变**内容：只新增文件、删除超期文件，从不原地修改已有文件（云盘同步更稳，也让后台任务能完成整轮备份）。
+
+## 还原
+
+\`\`\`bash
+# 完整还原（推荐：refs/* 全量，含 refs/original/*、refs/remotes/* 这些 clone 不会带的 ref）
+git clone --mirror "$DEST/repos/<标签>/<文件>.bundle" /tmp/restore.git
+
+# 日常还原：普通工作副本
+git clone "$DEST/repos/<标签>/<文件>.bundle" /tmp/restore
+git -C /tmp/restore log --oneline | head
+
+# 非 git 目录
+tar -xzf "$DEST/snapshots/<标签>/<文件>.tar.gz" -C /tmp/restore
+\`\`\`
+
+一键演练（会真的 clone 并比对 ref 与提交数）：
+
+\`\`\`bash
+$PROG --restore-drill
+\`\`\`
+
+## 覆盖范围
+
+- git 仓库 → \`git bundle --all\`：\`refs/heads/*\`、\`refs/tags/*\`、\`refs/remotes/*\`、\`refs/original/*\`，以及存在时的 \`refs/stash\`
+- 非 git 顶层目录 → tar 快照（默认排除 node_modules / dist / build / out / .venv / __pycache__ / .cache / tmp / *.log / .git）
+- **不在覆盖内**：仓库里未提交 / 未跟踪的改动；隐藏目录（如 \`.worktrees/\`）；家目录里的**凭据**、会话与历史、以及可重装的大体积内容。配置快照上云前会做一次密钥预检：命中疑似密钥就整份不收（本工具不加密）。
+
+## 注意
+
+- 云盘里的是**冷备**：OneDrive 之类的按需下载（占位文件）下 \`git clone\` 会自动触发下载，首次可能慢。
+- 快照默认排除 \`.env\` / \`.env.*\`（不加密上云），需要时用 \`DEV_BACKUP_INCLUDE_ENV=1\` 重跑。
+- 保存策略：每个目标保留最新 \`KEEP\`（默认 10）个产物，更旧的自动轮转删除。
+- 校验：\`--verify\` 会逐份检查（bundle 会真 clone 一次 + fsck）；\`--status\` 只查最新那份 + 云端上传状态。
+- 仓库改名/删除后会留下不再对应任何目标的目录：\`--status\` 会列出来，清理用 \`--prune-orphans\`（默认只列不删）再加 \`--apply\`。
+EOF
+  if [ -f "$DEST/README.md" ] && cmp -s "$tmp" "$DEST/README.md"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  cp -f "$tmp" "$DEST/.README.md.partial" || { rm -f "$tmp" "$DEST/.README.md.partial"; log "README 更新失败（写入被拒？）"; return 0; }
+  mv -f "$DEST/.README.md.partial" "$DEST/README.md" || { rm -f "$DEST/.README.md.partial"; log "README 更新失败（替换被拒？）"; return 0; }
+  rm -f "$tmp"
+  return 0
+}
+
+run_backup() {
+  require_dest
+  need_git
+  if [ ! -d "$DEV_ROOT" ]; then die "工作区根不存在：$DEV_ROOT"; fi
+  if [ ! -d "$(dirname "$DEST")" ]; then
+    die "备份目标的上级目录不存在：$(dirname "$DEST")（同步客户端没装/没登录？或路径写错了）"
+  fi
+  # macOS 隐私保护：后台任务读不到 FileProvider 域里**已有**的文件（EPERM），
+  # 症状是「看不到任何产物、写入失败」。先把话说清楚，别让人以为是备份逻辑坏了。
+  if fda_blocked; then die "$(fda_hint)"; fi
+  mkdir -p "$DEST/repos" "$DEST/snapshots" 2>/dev/null || die "无法写入 ${DEST}（会是权限或沙箱问题）"
+  write_readme
+  acquire_lock || die "等待备份锁超时（上一个备份还没结束）"
+  ensure_verify_repo
+  RUN_MANIFEST="$TMP/manifest-$STAMP-$$.tsv"
+  : >"$RUN_MANIFEST" 2>/dev/null
+  find "$TMP" -maxdepth 1 -mmin +60 \( -name '*.bundle' -o -name '*.tar.gz' \) -delete 2>/dev/null
+  log "开始备份：trigger=$TRIGGER dest=$DEST"
+  local n=0 r l t
+  while IFS="$(printf '\t')" read -r r l; do
+    [ -n "${r:-}" ] || continue
+    backup_repo "$r" "$l"
+    n=$((n + 1))
+  done < <(list_repos)
+  # 非仓库的顶层目录打快照（跳过隐藏目录；是仓库的话 .git 由 bundle 负责，含 worktree 的 .git 文件）
+  if [ "$DO_SNAPSHOTS" != "0" ]; then
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      case "$t" in .*) continue ;; esac
+      [ -d "$DEV_ROOT/$t" ] || continue
+      is_git_repo "$DEV_ROOT/$t" && continue
+      backup_snapshot "$t"
+    done < <(ls -1 "$DEV_ROOT" 2>/dev/null)
+  fi
+  # 工具配置：改动不产生提交，所以靠每日任务与手动跑兜住
+  local clabel chome citems
+  while IFS='|' read -r clabel chome citems; do
+    [ -n "${clabel:-}" ] || continue
+    backup_config "$clabel" "$chome" "$citems"
+  done < <(config_spec)
+  # 本次新增了什么 → 写成 manifests/<时间戳>-<触发源>.tsv（新文件，不改任何已有文件）
+  if [ -s "$RUN_MANIFEST" ]; then
+    mkdir -p "$DEST/manifests" 2>/dev/null
+    cp -f "$RUN_MANIFEST" "$DEST/manifests/$STAMP-$TRIGGER.tsv" 2>/dev/null \
+      && log "本次清单：manifests/$STAMP-$TRIGGER.tsv（$(wc -l <"$RUN_MANIFEST" | tr -d ' ') 条）" \
+      || log "清单写入失败（权限？），产物本身不受影响"
+  fi
+  rm -f "$RUN_MANIFEST"
+  date +%s >"$LOG_DIR/last-ok"
+  rm -f "$LOG_DIR/last-failure"
+  log "备份结束：仓库=$n"
+  out "  完成（$n 个 git 仓库 + 非仓库快照 + 工具配置）；日志 $LOG"
+  # 有目标被跳过（疑似密钥 / 读不到 / 归属冲突）时，整轮仍算失败：可见信号 + 非零退出
+  [ "${SOFT_FAIL:-0}" = "1" ] && die "有目标被跳过（疑似密钥、读不到或归属冲突，明细见日志）"
+  return 0
+}
+
+# ── 状态 / 校验 / 还原演练 ──────────────────────────────────────────────────
+list_targets() { # 输出「类型<TAB>标签<TAB>源路径」
+  list_repos | while IFS="$(printf '\t')" read -r r l; do printf 'repo\t%s\t%s\n' "$l" "$r"; done
+  if [ "$DO_SNAPSHOTS" != "0" ]; then
+    ls -1 "$DEV_ROOT" 2>/dev/null | while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      case "$t" in .*) continue ;; esac
+      [ -d "$DEV_ROOT/$t" ] || continue
+      is_git_repo "$DEV_ROOT/$t" && continue
+      printf 'snapshot\t%s\t%s\n' "$t" "$DEV_ROOT/$t"
+    done
+  fi
+  config_targets
+}
+
+# 云端那一腿也要看得见：本地文件写成功 ≠ 已上传。同步暂停/配额满时文件会一直「待上传」。
+# 上传状态先出**机器可读 token**，再由 upload_text 渲染成人读文案。
+# 两者分开，是因为 JSON 消费方（面板/DSH 插件）需要判据本身，而不是某国语言字符串。
+# token：uploaded|uploading|stale|unknown-nomdls|unknown-cloud
+upload_state() { # $1=文件；stale（超宽限期未上传）时返回 1
+  local st age
+  have mdls || { printf 'unknown-nomdls'; return 0; }
+  st="$(mdls -name kMDItemIsUploaded -raw "$1" 2>/dev/null)"
+  case "$st" in
+    1) printf 'uploaded' ;;
+    0)
+      age=$(( $(date +%s) - $(file_mtime "$1" || echo 0) ))
+      if [ "$age" -gt "$UPLOAD_GRACE" ]; then printf 'stale'; return 1; fi
+      printf 'uploading'
+      ;;
+    # mdls 对非云盘路径会返回空/(null)：明确说出来，别让它看起来像「已上传」
+    *) printf 'unknown-cloud' ;;
+  esac
+  return 0
+}
+
+upload_text() { # $1=token $2=文件（只为 stale 时算等待秒数）
+  case "$1" in
+    uploaded)       printf ' [已上传]' ;;
+    uploading)      printf ' [上传中]' ;;
+    stale)          printf ' [✗ 未上传云端（已等 %s 秒，同步暂停或配额满？）]' \
+                      "$(( $(date +%s) - $(file_mtime "$2" || echo 0) ))" ;;
+    unknown-nomdls) printf ' [上传状态未知（本平台没有 mdls）]' ;;
+    *)              printf ' [上传状态未知（不在云盘目录？）]' ;;
+  esac
+}
+
+upload_note() { # 保持旧接口：人读文案 + 同款退出码
+  local st rc
+  st="$(upload_state "$1")"; rc=$?
+  upload_text "$st" "$1"
+  return "$rc"
+}
+
+# ── 状态：一次判定，两种渲染 ────────────────────────────────────────────────
+# 判定只做一次（status_collect），人读文本与 --json 都是它的渲染。
+# 为什么强调这一点：同一规则写两遍必然漂移 —— 面板与插件对「失败是否被后来的成功盖过」
+# 曾经一个用 `>`、一个用 `>=`，面板会漏报后者专门修掉的那种情况。所以 JSON 不是
+# 「再算一遍」，而是同一次判定的另一个出口。
+#
+# 采集结果放全局，用制表符分隔的定长记录承载（bash 3.2 没有关联数组）：
+#   S_ROWS     人读文本行
+#   S_RECORDS  定长记录（US 分隔）：kind label state artifact at bytes sha256 upload dirty message
+#   S_REASONS  定长记录（US 分隔）：code target message
+#   S_ORPHANS  备份目录里残留的相对路径
+# 记录用 ASCII 单元分隔符 US（\x1f）拼接，**不能用制表符**：
+# 制表符属于 IFS 空白，read 会把连续的分隔符折叠掉、并吃掉首尾空白 ——
+# 于是「没有 sidecar」「没有未提交改动」这类**空字段**会消失，整条记录错位。
+SEP=$'\x1f'
+
+status_record() { # kind label state artifact at bytes sha256 upload dirty message
+  S_RECORDS[${#S_RECORDS[@]}]="$1$SEP$2$SEP$3$SEP$4$SEP$5$SEP$6$SEP$7$SEP$8$SEP$9$SEP${10}"
+}
+
+status_reason() { # code target message
+  S_REASONS[${#S_REASONS[@]}]="$1$SEP$2$SEP$3"
+}
+
+# 产物时间：优先取**文件名里的 UTC 时间戳**，取不到才退回 mtime。
+# 与 newest_of 用文件名排序同一个理由：云盘重新物化会改写 mtime，那不可信。
+artifact_epoch() {
+  local base stamp ep
+  base="$(basename "$1")"
+  stamp="$(printf '%s' "$base" | sed -n 's/.*-\([0-9]\{8\}T[0-9]\{6\}Z\)-.*/\1/p')"
+  if [ -n "$stamp" ]; then
+    ep="$(stamp_to_epoch "$stamp")"
+    [ -n "$ep" ] && { printf '%s' "$ep"; return 0; }
+  fi
+  file_mtime "$1" || printf ''
+}
+
+status_collect() {
+  need_git
+  local kind label src b sha short now age note dirty latest known upload state msg at bytes sum
+  S_RC=0; S_DEST_MISSING=0; S_FDA=0
+  S_HEADER="== ${DEV_ROOT} → 冷备状态（目标 ${DEST:-未配置}）"
+  S_ROWS=(); S_RECORDS=(); S_REASONS=(); S_ORPHANS=()
+  now="$(date +%s)"
+  if [ -z "$DEST" ]; then
+    S_RC=2; S_DEST_MISSING=1
+    msg="还没有配置备份目标（DEST）"
+    S_ROWS[0]="  ✗ ${msg}"
+    status_reason unconfigured - "$msg"
+    return 0
+  fi
+  if [ ! -d "$DEST" ]; then
+    S_RC=1; S_DEST_MISSING=1
+    msg="备份目录不存在：${DEST}"
+    S_ROWS[0]="  ✗ ${msg}"
+    status_reason dest-missing - "$msg"
+    return 0
+  fi
+  # 读不到已有产物时，下面每一条都会误报成「没有 bundle / 落后」，先把真正的原因说清楚
+  if fda_blocked; then
+    S_RC=1; S_FDA=1
+    msg="$(fda_hint)"
+    S_ROWS[0]="  ✗ ${msg}"
+    status_reason fda-blocked - "$msg"
+    return 0
+  fi
+  while IFS="$(printf '\t')" read -r kind label src; do
+    [ -n "${label:-}" ] || continue
+    case "$kind" in
+      repo)
+        sha="$(git -C "$src" rev-parse HEAD 2>/dev/null || true)"
+        short="${sha:0:12}"
+        if [ -z "$sha" ]; then
+          S_ROWS[${#S_ROWS[@]}]="  ! ${label}：没有提交，跳过"
+          status_record repo "$label" skipped "" "" "" "" "" "" "没有提交，跳过"
+          continue
+        fi
+        # 要回答的问题是「**HEAD 这一份**备上了吗」，所以按 HEAD 找文件，
+        # 而不是「文件名最大的那一份」。
+        # 两者在正常情况下一致，但换过分支 / 历史被重写之后，备份目录里会留下时间戳更晚、
+        # 对应别的提交的 bundle；而 backup_repo 又因为「该提交已有完好 bundle」而跳过新建，
+        # 时间戳再也不会前进 —— 于是 newest_bundle 永远指向那份不匹配的文件，
+        # `--status` 就**永久**误报「落后」（实测：一次分支实验之后就卡死了）。
+        b="$(ls -1 "$DEST/repos/$label"/*-"$short".bundle 2>/dev/null | sort | tail -1)"
+        if [ -z "$b" ]; then
+          latest="$(newest_bundle "$DEST/repos/$label")"
+          S_RC=1
+          if [ -z "$latest" ]; then
+            state="missing"; msg="没有 bundle（提交 ${short} 未备份）"
+          else
+            state="behind";  msg="备份落后（HEAD ${short}，最新 bundle $(basename "$latest")）"
+          fi
+          S_ROWS[${#S_ROWS[@]}]="  ✗ ${label}：${msg}"
+          status_reason "$state" "$label" "$msg"
+          status_record repo "$label" "$state" "" "" "" "" "" "" "$msg"
+          continue
+        fi
+        upload="$(upload_state "$b")" || { S_RC=1; status_reason not-uploaded "$label" "产物未上传到云端"; }
+        note="$(upload_text "$upload" "$b")"
+        if ! sidecar_ok "$b"; then note="${note} [✗ .sha256 缺失或不符]"; S_RC=1; status_reason sidecar "$label" ".sha256 缺失或不符"; fi
+        dirty="$(git -C "$src" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+        [ "${dirty:-0}" != "0" ] && note="${note} [${dirty} 个未提交改动不在备份内]"
+        S_ROWS[${#S_ROWS[@]}]="  ✓ ${label}：最新提交 ${short} 已备份（$(basename "$b")）${note}"
+        at="$(artifact_epoch "$b")"; bytes="$(file_size "$b" || printf '')"
+        sum="$(tr -d '\n' <"$b.sha256" 2>/dev/null)"
+        status_record repo "$label" ok "$(basename "$b")" "$at" "$bytes" "$sum" "$upload" "${dirty:-0}" "最新提交 ${short} 已备份"
+        ;;
+      snapshot)
+        b="$(newest_snapshot "$DEST/snapshots/$label")"
+        if [ -z "$b" ]; then
+          # 非 git 目录只有快照这一条备份路径，一份都没有 = 没备上（空目录也会产生快照）
+          S_RC=1; msg="还没有快照"
+          S_ROWS[${#S_ROWS[@]}]="  ✗ ${label}：${msg}"
+          status_reason missing-snapshot "$label" "$msg"
+          status_record snapshot "$label" missing "" "" "" "" "" "" "$msg"
+          continue
+        fi
+        age=$(( (now - $(file_mtime "$b" || echo "$now")) / 86400 ))
+        upload="$(upload_state "$b")" || { S_RC=1; status_reason not-uploaded "$label" "快照未上传到云端"; }
+        note="$(upload_text "$upload" "$b")"
+        if ! gzip -t "$b" >/dev/null 2>&1; then note="${note} [✗ gzip 校验失败]"; S_RC=1; status_reason gzip "$label" "gzip 校验失败"; fi
+        S_ROWS[${#S_ROWS[@]}]="  ✓ ${label}：$(basename "$b")（${age} 天前）${note}"
+        at="$(artifact_epoch "$b")"; bytes="$(file_size "$b" || printf '')"
+        status_record snapshot "$label" ok "$(basename "$b")" "$at" "$bytes" "" "$upload" "" "$(basename "$b")（${age} 天前）"
+        ;;
+      config)
+        b="$(newest_snapshot "$DEST/configs/$label")"
+        if [ -z "$b" ]; then
+          S_RC=1; msg="还没有配置快照（${src}）"
+          S_ROWS[${#S_ROWS[@]}]="  ✗ ${label}：${msg}"
+          status_reason missing-config "$label" "$msg"
+          status_record config "$label" missing "" "" "" "" "" "" "$msg"
+          continue
+        fi
+        upload="$(upload_state "$b")" || { S_RC=1; status_reason not-uploaded "$label" "配置快照未上传到云端"; }
+        note="$(upload_text "$upload" "$b")"
+        if ! gzip -t "$b" >/dev/null 2>&1; then note="${note} [✗ gzip 校验失败]"; S_RC=1; status_reason gzip "$label" "gzip 校验失败"; fi
+        S_ROWS[${#S_ROWS[@]}]="  ✓ ${label}：$(basename "$b")${note}"
+        at="$(artifact_epoch "$b")"; bytes="$(file_size "$b" || printf '')"
+        status_record config "$label" ok "$(basename "$b")" "$at" "$bytes" "" "$upload" "" "$(basename "$b")"
+        ;;
+    esac
+  done < <(list_targets)
+  # 备份目录里已不对应任何目标的残留目录（仓库改名/删除后）：只提示，不影响 rc
+  # 注意：不能用 awk -F'\t' —— macOS 自带的是 BWK awk，会把 \t 当成字母 t，切错字段。
+  known="$(list_targets | cut -f1,2 | tr '\t' '|')"
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    S_ORPHANS[${#S_ORPHANS[@]}]="$rel"
+    S_ROWS[${#S_ROWS[@]}]="  ! 备份目录残留：${rel}（已不对应工作区里的目标；清理：${PROG} --prune-orphans --apply）"
+  done < <(orphan_dirs "$known")
+  # 别的工作区/主机的产物：不是「残留」，也不能清 —— 只作为事实说明，不进 orphans[]
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    S_ROWS[${#S_ROWS[@]}]="  ! 属于别的工作区：${rel}（本工作区不会碰它）"
+  done < <(foreign_dirs "$known")
+  if [ -f "$LOG_DIR/last-failure" ]; then
+    S_RC=1
+    msg="$(tail -1 "$LOG_DIR/last-failure" 2>/dev/null | cut -f3)"
+    S_ROWS[${#S_ROWS[@]}]="  ✗ 上次运行失败：${msg}"
+    status_reason last-failure - "$msg"
+  fi
+  [ "$S_RC" -eq 0 ] && S_ROWS[${#S_ROWS[@]}]="  ✓ 全部仓库的最新提交都已备份并上传"
+  return 0
+}
+
+run_status() {
+  status_collect
+  local row
+  out "$S_HEADER"
+  for row in ${S_ROWS[@]+"${S_ROWS[@]}"}; do out "$row"; done
+  return "$S_RC"
+}
+
+# ── JSON 渲染（契约 dev-backup.status/1；消费者：macOS 面板、DSH 插件）───────
+# 退出码与 --status 完全一致：0 = 一切都好，1 = 有问题。JSON 里另有 verdict 字段，
+# 让消费方不必靠退出码猜（也便于未来加 warn 档而不破坏 rc 语义）。
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/\\t}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  printf '"%s"' "$s"
+}
+
+json_num_or_null() { case "${1:-}" in ''|*[!0-9]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+
+# 文本字段用 null 而不是空串：消费方一眼分得清「这个目标没有该字段」和「字段是空字符串」
+json_text_or_null() { [ -n "${1:-}" ] && json_escape "$1" || printf 'null'; }
+
+last_ok_epoch() { # 与面板/插件的读法一致：纯数字当 epoch 秒，否则退回 mtime
+  local raw
+  [ -f "$LOG_DIR/last-ok" ] || return 0
+  raw="$(tr -d ' \n\t' <"$LOG_DIR/last-ok" 2>/dev/null)"
+  case "$raw" in
+    ''|*[!0-9]*) file_mtime "$LOG_DIR/last-ok" ;;
+    *) printf '%s' "$raw" ;;
+  esac
+}
+
+json_last_failure() {
+  local line ep trg msg
+  [ -f "$LOG_DIR/last-failure" ] || { printf 'null'; return 0; }
+  line="$(tail -1 "$LOG_DIR/last-failure" 2>/dev/null)"
+  [ -n "$line" ] || { printf 'null'; return 0; }
+  ep="$(printf '%s' "$line" | cut -f1 | sed 's/^epoch=//')"
+  trg="$(printf '%s' "$line" | cut -f2 | sed 's/^trigger=//')"
+  msg="$(printf '%s' "$line" | cut -f3)"
+  printf '{"epoch": %s, "trigger": %s, "message": %s}' \
+    "$(json_num_or_null "$ep")" "$(json_escape "$trg")" "$(json_escape "$msg")"
+}
+
+run_status_json() {
+  status_collect
+  local rec kind label state artifact at bytes sum upload dirty message code target
+  local verdict="ok" first n_repo=0 n_snap=0 n_cfg=0 n_problem=0 n_orphan=0
+  [ "$S_RC" -ne 0 ] && verdict="bad"
+
+  printf '{\n'
+  printf '  "schema": "%s",\n' "$SCHEMA"
+  printf '  "generatedAt": %s,\n' "$(date +%s)"
+  printf '  "root": %s,\n' "$(json_escape "$DEV_ROOT")"
+  printf '  "dest": %s,\n' "$(json_escape "$DEST")"
+  printf '  "verdict": "%s",\n' "$verdict"
+  printf '  "lastOk": %s,\n' "$(json_num_or_null "$(last_ok_epoch)")"
+  printf '  "lastFailure": %s,\n' "$(json_last_failure)"
+
+  printf '  "orphans": ['
+  first=1
+  for rec in ${S_ORPHANS[@]+"${S_ORPHANS[@]}"}; do
+    n_orphan=$((n_orphan + 1))
+    [ "$first" = "1" ] && first=0 || printf ', '
+    printf '%s' "$(json_escape "$rec")"
+  done
+  printf '],\n'
+
+  printf '  "reasons": ['
+  first=1
+  for rec in ${S_REASONS[@]+"${S_REASONS[@]}"}; do
+    IFS="$SEP" read -r code target message <<<"$rec"
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '\n    {"code": %s, "target": %s, "message": %s}' \
+      "$(json_escape "$code")" "$(json_escape "$target")" "$(json_escape "$message")"
+  done
+  if [ "$first" = "1" ]; then printf '],\n'; else printf '\n  ],\n'; fi
+
+  printf '  "targets": ['
+  first=1
+  for rec in ${S_RECORDS[@]+"${S_RECORDS[@]}"}; do
+    IFS="$SEP" read -r kind label state artifact at bytes sum upload dirty message <<<"$rec"
+    case "$kind" in
+      repo)     n_repo=$((n_repo + 1)) ;;
+      snapshot) n_snap=$((n_snap + 1)) ;;
+      config)   n_cfg=$((n_cfg + 1)) ;;
+    esac
+    case "$state" in ok|skipped|"") : ;; *) n_problem=$((n_problem + 1)) ;; esac
+    [ "$first" = "1" ] && first=0 || printf ','
+    printf '\n    {"kind": %s, "label": %s, "state": %s, "artifact": %s, "at": %s, "bytes": %s, "sha256": %s, "upload": %s, "dirty": %s, "message": %s}' \
+      "$(json_escape "$kind")" "$(json_escape "$label")" "$(json_escape "$state")" \
+      "$(json_text_or_null "$artifact")" "$(json_num_or_null "$at")" "$(json_num_or_null "$bytes")" \
+      "$(json_text_or_null "$sum")" "$(json_text_or_null "$upload")" "$(json_num_or_null "$dirty")" \
+      "$(json_escape "$message")"
+  done
+  if [ "$first" = "1" ]; then printf '],\n'; else printf '\n  ],\n'; fi
+
+  printf '  "counts": {"repos": %s, "snapshots": %s, "configs": %s, "problems": %s, "orphans": %s}\n' \
+    "$n_repo" "$n_snap" "$n_cfg" "$n_problem" "$n_orphan"
+  printf '}\n'
+  return "$S_RC"
+}
+
+# 备份目录里「已不对应任何目标」的目录（仓库改名/删除、配置白名单调整之后留下的）。
+# 输出相对 $DEST 的路径，例如 `repos/old-name`。状态与清理共用这一段，避免两处判据漂移。
+#
+# 分三类处理：
+#   ours    —— 我们建的：正常残留，可清
+#   unowned —— 没有归属标记（旧版本产物 / 手工放进去的）：按「大概是自己的」处理，
+#              保持与旧版本一致的行为，否则升级后所有人都会看到一堆「未知归属」
+#   foreign —— 归属标记属于**别的工作区/主机**：绝不删除，也不算「残留」
+# 为什么必须分：两个工作区（或两台机器）指向同一个备份目录时标签会撞名，
+# 把对方的产物当残留删掉是**数据丢失**，不是清理。
+orphan_scan() { # $1=（可选）已知目标清单「类型|标签」多行；$2=orphan|foreign
+  local known="${1:-}" want="${2:-orphan}"
+  [ -n "$known" ] || known="$(list_targets | cut -f1,2 | tr '\t' '|')"
+  local dir rel kind label cls
+  for dir in "$DEST/repos"/* "$DEST/snapshots"/* "$DEST/configs"/*; do
+    [ -d "$dir" ] || continue
+    rel="${dir#"$DEST"/}"
+    case "$rel" in
+      repos/*)     kind="repo";     label="${rel#repos/}" ;;
+      snapshots/*) kind="snapshot"; label="${rel#snapshots/}" ;;
+      configs/*)   kind="config";   label="${rel#configs/}" ;;
+      *) continue ;;
+    esac
+    printf '%s\n' "$known" | grep -Fxq "${kind}|${label}" && continue
+    cls="$(owner_class "$rel")"
+    if [ "$want" = "foreign" ]; then
+      [ "$cls" = "foreign" ] && printf '%s\n' "$rel"
+    else
+      [ "$cls" = "foreign" ] || printf '%s\n' "$rel"
+    fi
+  done
+}
+
+orphan_dirs()  { orphan_scan "${1:-}" orphan; }
+foreign_dirs() { orphan_scan "${1:-}" foreign; }
+
+# foreign 时拒绝写入：宁可这一轮少备一个目标并明确报错，也不去覆盖别的工作区的产物
+owner_guard() { # $1=相对路径 $2=标签
+  [ "$(owner_class "$1")" = "foreign" ] || return 0
+  log "跳过 ${2}：$DEST/$1 属于别的工作区（$(tr -d ' \n' <"$DEST/$1/$OWNER_FILE" 2>/dev/null)）"
+  out "  ✗ ${2}：$1 已属于另一个工作区/主机，本轮跳过（换 DEST，或在本机把 WORKSPACE_ID 设成同一个值）"
+  SOFT_FAIL=1
+  return 1
+}
+
+run_prune_orphans() { # 默认 dry-run；--apply 才真删
+  require_dest
+  local rel n=0 removed=0 failed=0 size foreign=0
+  out "== 备份目录残留清理（目标 ${DEST}）"
+  if [ ! -d "$DEST" ]; then out "  ✗ 备份目录不存在"; return 1; fi
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    n=$((n + 1))
+    size="$(du -sh "$DEST/$rel" 2>/dev/null | cut -f1)"
+    if [ "$APPLY" = "1" ]; then
+      if rm -rf "${DEST:?}/$rel"; then
+        removed=$((removed + 1))
+        out "  ✓ 已删除 ${rel}（${size:-?}）"
+        log "--prune-orphans 删除 ${rel}"
+      else
+        # 删不掉就是没删掉：一定要让退出码说出来（旧版本这里静默返回 0）
+        failed=$((failed + 1))
+        out "  ✗ 删除失败（权限？）：${rel}"
+        log "--prune-orphans 删除失败：${rel}"
+      fi
+    else
+      out "  · 待删 ${rel}（${size:-?}）—— 加 --apply 才真删"
+    fi
+  done < <(orphan_dirs)
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    foreign=$((foreign + 1))
+    out "  · 跳过 ${rel}（属于别的工作区，本工作区不删）"
+  done < <(foreign_dirs)
+  if [ "$n" -eq 0 ]; then
+    out "  ✓ 没有残留目录"
+  elif [ "$APPLY" = "1" ]; then
+    out "  共删除 ${removed}/${n} 个"
+  else
+    out "  共 ${n} 个待删（dry-run，未改动任何东西）"
+  fi
+  [ "$foreign" -gt 0 ] && out "  另有 ${foreign} 个属于别的工作区（不删）"
+  [ "$failed" -gt 0 ] && return 1
+  return 0
+}
+
+deep_verify_bundle() { # $1=bundle：真校验——镜像 clone 到临时目录（index-pack 会抓截断/尾部垃圾），再 fsck
+  local b="$1" tmp="$TMP/deep-verify"
+  rm -rf "$tmp"
+  git clone -q --mirror "$b" "$tmp" >>"$LOG" 2>&1 || { rm -rf "$tmp"; return 1; }
+  git -C "$tmp" fsck --no-progress --no-dangling >>"$LOG" 2>&1 || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  return 0
+}
+
+run_verify() {
+  require_dest
+  need_git
+  local rc=0 kind label src b f n side_bad
+  out "== 校验产物完整性（逐份；bundle 会真 clone 一次）"
+  if [ ! -d "$DEST" ]; then out "  ✗ 备份目录不存在：${DEST}"; return 1; fi
+  # ⚠️ 必须在任何删除之前拦一道：读不到产物时校验必然「失败」，而 --fix 会把失败当损坏
+  # 直接 rm -f —— 也就是**用缺授权把好产物删光**。这里宁可什么都不做。
+  if fda_blocked; then
+    out "  ✗ $(fda_hint)"
+    out "  ! 已中止，未删除任何产物（读不到内容时 --fix 会把好产物误判成损坏）"
+    return 1
+  fi
+  ensure_verify_repo
+  while IFS="$(printf '\t')" read -r kind label src; do
+    [ -n "${label:-}" ] || continue
+    case "$kind" in
+      repo)
+        b="$(newest_bundle "$DEST/repos/$label")"
+        if [ -z "$b" ]; then out "  ✗ ${label}：没有任何 bundle"; rc=1; continue; fi
+        n=0
+        for f in "$DEST/repos/$label"/*.bundle; do
+          [ -f "$f" ] || continue
+          n=$((n + 1))
+          side_bad=0
+          sidecar_ok "$f" || side_bad=1
+          # 最新那份 + 指纹可疑的，做真 clone 校验；其余至少过一遍 bundle 结构校验
+          if [ "$side_bad" -eq 1 ] || [ "$f" = "$b" ] || [ "${DEV_BACKUP_DEEP_ALL:-0}" = "1" ]; then
+            if deep_verify_bundle "$f"; then
+              [ "$side_bad" -eq 1 ] && out "  ! $(basename "$f")：.sha256 缺失或不符，但内容可还原" \
+                                    || out "  ✓ $(basename "$f")：可完整 clone（fsck 通过）"
+            else
+              out "  ✗ $(basename "$f")：无法 clone（文件已损坏）"; rc=1
+              if [ "$FIX" = "1" ]; then rm -f "$f" "$f.sha256"; log "--fix 删除损坏产物 $(basename "$f")"; out "     已删除（重跑备份会重建最新那份）"; fi
+            fi
+          else
+            if [ "$side_bad" -eq 1 ]; then
+              out "  ! $(basename "$f")：.sha256 缺失或不符"; rc=1
+            elif verify_bundle "$f" >/dev/null 2>&1; then
+              out "  ✓ $(basename "$f")：结构完整"
+            else
+              out "  ✗ $(basename "$f")：git bundle verify 失败"; rc=1
+              [ "$FIX" = "1" ] && { rm -f "$f" "$f.sha256"; out "     已删除"; }
+            fi
+          fi
+        done
+        ;;
+      snapshot|config)
+        if [ "$kind" = "snapshot" ]; then b="$(newest_snapshot "$DEST/snapshots/$label")"; else b="$(newest_snapshot "$DEST/configs/$label")"; fi
+        if [ -z "$b" ]; then out "  ✗ ${label}：还没有快照"; rc=1; continue; fi
+        for f in "$DEST/snapshots/$label"/*.tar.gz "$DEST/configs/$label"/*.tar.gz; do
+          [ -f "$f" ] || continue
+          if gzip -t "$f" >/dev/null 2>&1 && tar -tzf "$f" >/dev/null 2>&1; then
+            out "  ✓ $(basename "$f")：可完整解压"
+          else
+            out "  ✗ $(basename "$f")：损坏"; rc=1
+            if [ "$FIX" = "1" ]; then rm -f "$f"; log "--fix 删除损坏快照 $(basename "$f")"; out "     已删除（重跑备份会重建）"; fi
+          fi
+        done
+        ;;
+    esac
+  done < <(list_targets)
+  return "$rc"
+}
+
+ref_list() { git -C "$1" for-each-ref --format='%(refname) %(objectname)' 2>/dev/null | sort; }
+# 严格指纹：不含 refs/remotes/*（远端跟踪 ref 是派生状态——`git push`/`git fetch` 会改它们
+# 但不产生提交、因而不触发备份；它们随时可以用 git fetch 重建，不是需要备份的数据）。
+ref_fingerprint() { ref_list "$1" | grep -v '^refs/remotes/' | sha256_stdin; }
+# 远端跟踪 ref 的漂移条数：只作为提示，不参与成败判定
+remote_drift() {
+  diff <(ref_list "$1" | grep '^refs/remotes/') <(ref_list "$2" | grep '^refs/remotes/') 2>/dev/null | grep -c '^[<>]'
+}
+
+run_drill() { # 真还原：镜像 clone 每个最新 bundle，比对全部 ref 与提交数
+  require_dest
+  need_git
+  local base="${DRILL_DIR_OPT:-${DRILL_BASE:-$TMP/drill-$STAMP}}"
+  local rc=0 kind label src b dst work sc dc sref dref hsrc hdst nref drift extra
+  mkdir -p "$base" || die "无法创建演练目录 ${base}"
+  out "== 还原演练（目标 ${base}）"
+  while IFS="$(printf '\t')" read -r kind label src; do
+    [ "$kind" = "repo" ] || continue
+    [ -n "${label:-}" ] || continue
+    b="$(newest_bundle "$DEST/repos/$label")"
+    [ -n "$b" ] || { out "  ✗ ${label}：没有 bundle"; rc=1; continue; }
+    # ① 镜像还原：bundle 当远端，refs/* 全量还原。
+    #    注意普通 clone 只会带 refs/heads 与 tags，refs/original/*（filter-branch 旧历史）、
+    #    refs/remotes/* 这类 ref 会被丢掉——那正是真正需要备份的东西。
+    dst="$base/$label.git"
+    rm -rf "$dst"
+    if ! git clone -q --mirror "$b" "$dst" >>"$LOG" 2>&1; then out "  ✗ ${label}：镜像 clone 失败"; rc=1; continue; fi
+    sc="$(git -C "$src" rev-list --count --all)"
+    dc="$(git -C "$dst" rev-list --count --all)"
+    sref="$(ref_fingerprint "$src")"
+    dref="$(ref_fingerprint "$dst")"
+    # ② 顺带证明日常路径可用：普通 clone 出的工作副本 HEAD 必须与源一致
+    work="$base/$label"
+    rm -rf "$work"
+    if ! git clone -q "$b" "$work" >>"$LOG" 2>&1; then out "  ✗ ${label}：工作副本 clone 失败"; rc=1; continue; fi
+    hsrc="$(git -C "$src" rev-parse HEAD 2>/dev/null)"
+    hdst="$(git -C "$work" rev-parse HEAD 2>/dev/null)"
+    if [ "$sc" = "$dc" ] && [ "$sref" = "$dref" ] && [ "$hsrc" = "$hdst" ]; then
+      nref="$(git -C "$dst" for-each-ref | wc -l | tr -d ' ')"
+      drift="$(remote_drift "$src" "$dst")"
+      extra=""
+      [ "${drift:-0}" != "0" ] && extra="；refs/remotes/* 有 ${drift} 处漂移（派生状态，git fetch 可重建）"
+      out "  ✓ ${label}：${dc} 个提交、${nref} 个 ref 一致（含 heads/tags/stash），工作副本 HEAD ${hdst} 一致${extra}"
+    else
+      out "  ✗ ${label}：不一致（提交数 源 ${sc} / 还原 ${dc}；本地 ref 指纹 ${sref} / ${dref}；HEAD ${hsrc} / ${hdst}）"
+      rc=1
+    fi
+  done < <(list_targets)
+  [ "$rc" -eq 0 ] && out "  ✓ 演练通过：备份目录里的副本可以完整还原"
+  return "$rc"
+}
+
+# 每日巡检：补跑一次备份（覆盖「长期不提交/钩子被绕过/关机错过」），再把产物与云端状态查一遍。
+# 任何一项不过 → 非零退出 + 通知（launchd/cron 会把非零退出记进日志）。
+run_daily() {
+  local rc=0
+  [ "$TRIGGER" = "manual" ] && TRIGGER="daily"
+  out "== 每日巡检（$(date '+%Y-%m-%d %H:%M')）"
+  run_backup || rc=1                 # 备份失败会走 die（通知 + 退出 1）
+  out ""; run_verify || { rc=1; out "  ✗ 产物校验未通过"; }
+  out ""; run_status || { rc=1; out "  ✗ 状态检查未通过"; }
+  if [ "$rc" -ne 0 ]; then
+    log "每日巡检未通过 rc=${rc}"
+    notify "每日巡检未通过 rc=${rc}（日志 ${LOG}）"
+  else
+    log "每日巡检通过"
+  fi
+  return "$rc"
+}
+
+# ── 定时任务（macOS: launchd；其他: cron）───────────────────────────────────
+# 只做「装一个跑 --daily 的任务」这一件事。要跑带 FDA 授权的 GUI app 之类，
+# 用 --program 指向那个可执行文件；`--dry-run` 只打印计划、不碰系统。
+sched_time_parts() { # 解析 --at HH:MM → 打印 "H M"
+  local t="$SCHED_AT" h m
+  case "$t" in
+    *:*) h="${t%%:*}"; m="${t#*:}" ;;
+    *) printf '时间格式应为 HH:MM（当前：%s）\n' "$t" >&2; return 1 ;;
+  esac
+  case "$h$m" in *[!0-9]*) printf '时间格式应为 HH:MM（当前：%s）\n' "$t" >&2; return 1 ;; esac
+  h="${h#0}"; m="${m#0}"; [ -n "$h" ] || h=0; [ -n "$m" ] || m=0
+  [ "$h" -le 23 ] && [ "$m" -le 59 ] || { printf '时间超出范围：%s\n' "$t" >&2; return 1; }
+  printf '%s %s' "$h" "$m"
+}
+
+sched_program() { [ -n "$SCHED_PROGRAM" ] && printf '%s' "$SCHED_PROGRAM" || printf '%s' "$SELF"; }
+sched_log() { printf '%s/schedule.log' "$LOG_DIR"; }
+
+launchd_plist_path() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$SCHED_LABEL"; }
+
+launchd_plist_text() { # 打印 plist 内容（安装与 --dry-run 共用同一次生成）
+  local hp mp parts
+  # 注意别写成 `$(sched_time_parts | cut -d' ' -f1)`：管道的退出码是 cut 的，
+  # 时间非法时会被静默吞掉（实测：`--at 25:00` 曾经照样输出 plist 并退 0）。
+  parts="$(sched_time_parts)" || return 1
+  hp="${parts%% *}"; mp="${parts##* }"
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${SCHED_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(sched_program)</string>
+    <string>--daily</string>
+    <string>--trigger=launchd</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>${hp}</integer>
+    <key>Minute</key><integer>${mp}</integer>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>${LOG_DIR}/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>${LOG_DIR}/launchd.err.log</string>
+</dict>
+</plist>
+EOF
+}
+
+cron_block() { # 打印受管区块（前后有哨兵行，安装时整块替换）
+  local hp mp parts
+  parts="$(sched_time_parts)" || return 1
+  hp="${parts%% *}"; mp="${parts##* }"
+  printf '# >>> dev-backup >>>\n'
+  printf '%s %s * * * %s --daily --trigger=cron >> %s 2>&1\n' "$mp" "$hp" "$(sched_program)" "$(sched_log)"
+  printf '# <<< dev-backup <<<\n'
+}
+
+cron_without_block() { # 现有 crontab 去掉受管区块；没有 crontab 时输出空
+  crontab -l 2>/dev/null | sed '/^# >>> dev-backup >>>$/,/^# <<< dev-backup <<<$/d' | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba'
+}
+
+sched_install() {
+  case "$SCHED_KIND" in
+    ""|launchd|cron) ;;
+    *) printf '未知的任务类型：%s（只支持 launchd 或 cron）\n' "$SCHED_KIND" >&2; return 2 ;;
+  esac
+  local kind="${SCHED_KIND:-launchd}"
+  if [ -z "$SCHED_KIND" ]; then [ "$IS_DARWIN" = "1" ] && kind="launchd" || kind="cron"; fi
+  mkdir -p "$LOG_DIR" 2>/dev/null
+  if [ "$kind" = "launchd" ]; then
+    local plist; plist="$(launchd_plist_path)"
+    if [ "$DRY_RUN" = "1" ]; then
+      out "（dry-run）会写入：$plist"
+      launchd_plist_text
+      return 0
+    fi
+    mkdir -p "$(dirname "$plist")" || { printf '无法创建 %s\n' "$(dirname "$plist")" >&2; return 1; }
+    launchd_plist_text >"$plist.tmp" || return 1
+    mv -f "$plist.tmp" "$plist" || return 1
+    launchctl bootout "gui/$(id -u)/$SCHED_LABEL" >/dev/null 2>&1
+    launchctl bootstrap "gui/$(id -u)" "$plist" >/dev/null 2>&1 \
+      || launchctl load -w "$plist" >/dev/null 2>&1 \
+      || { printf '✗ 任务写入成功但加载失败：%s\n  手动加载：launchctl bootstrap gui/%s %s\n' "$plist" "$(id -u)" "$plist" >&2; return 1; }
+    out "  ✓ 已安装 launchd 任务 ${SCHED_LABEL}（每天 $SCHED_AT 跑 --daily）"
+    out "    plist：$plist"
+    out "    日志：$LOG_DIR/launchd.{out,err}.log"
+    if [ -n "$DEST" ] && [ "$IS_DARWIN" = "1" ]; then
+      case "$DEST" in
+        "$HOME/Library/CloudStorage/"*|"$HOME/Library/Mobile Documents/"*)
+          out "  ! 备份目标在 macOS 受保护目录下：后台任务可能读不到已有产物，"
+          out "    需要给运行它的程序「完全磁盘访问权限」，或用 --program 指向一个已授权的程序。" ;;
+      esac
+    fi
+    return 0
+  fi
+  have crontab || { printf '本机没有 crontab 命令（Linux 上装 cron 或改用 systemd timer）\n' >&2; return 1; }
+  if [ "$DRY_RUN" = "1" ]; then
+    out "（dry-run）会把下面这段写进 crontab："
+    cron_block
+    return 0
+  fi
+  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
+  { cron_without_block; cron_block; } >"$candidate" || { rm -f "$candidate"; return 1; }
+  crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败（原 crontab 未改动）\n' >&2; return 1; }
+  rm -f "$candidate"
+  if crontab -l 2>/dev/null | grep -Fq '>>> dev-backup >>>'; then
+    out "  ✓ 已安装 cron 任务（每天 $SCHED_AT 跑 --daily）"
+    out "    日志：$(sched_log)"
+  else
+    printf '✗ crontab 写入后没读到受管区块（请 crontab -l 自查）\n' >&2; return 1
+  fi
+  return 0
+}
+
+sched_uninstall() {
+  local kind="${SCHED_KIND:-}"; [ -n "$kind" ] || { [ "$IS_DARWIN" = "1" ] && kind="launchd" || kind="cron"; }
+  if [ "$kind" = "launchd" ]; then
+    local plist; plist="$(launchd_plist_path)"
+    if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会卸载 ${SCHED_LABEL} 并删除 $plist"; return 0; fi
+    launchctl bootout "gui/$(id -u)/$SCHED_LABEL" >/dev/null 2>&1 || launchctl unload -w "$plist" >/dev/null 2>&1
+    rm -f "$plist"
+    out "  ✓ 已卸载 launchd 任务 ${SCHED_LABEL}"
+    return 0
+  fi
+  have crontab || { printf '本机没有 crontab 命令\n' >&2; return 1; }
+  if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会从 crontab 里删掉受管区块"; return 0; fi
+  local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
+  cron_without_block >"$candidate" || { rm -f "$candidate"; return 1; }
+  crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败\n' >&2; return 1; }
+  rm -f "$candidate"
+  out "  ✓ 已从 crontab 删掉受管区块"
+  return 0
+}
+
+sched_status() {
+  local kind="${SCHED_KIND:-}"; [ -n "$kind" ] || { [ "$IS_DARWIN" = "1" ] && kind="launchd" || kind="cron"; }
+  if [ "$kind" = "launchd" ]; then
+    local plist; plist="$(launchd_plist_path)"
+    if [ ! -f "$plist" ]; then out "  · 没有安装 launchd 任务（$plist 不存在）"; return 0; fi
+    out "  ✓ plist 存在：$plist"
+    if launchctl print "gui/$(id -u)/$SCHED_LABEL" >/dev/null 2>&1; then
+      out "  ✓ 任务已加载：$SCHED_LABEL"
+    else
+      out "  ! 任务未加载（launchctl bootstrap gui/$(id -u) ${plist}）"
+    fi
+    return 0
+  fi
+  have crontab || { out "  · 本机没有 crontab 命令"; return 0; }
+  if crontab -l 2>/dev/null | grep -Fq '>>> dev-backup >>>'; then
+    out "  ✓ crontab 里有受管区块："
+    crontab -l 2>/dev/null | sed -n '/^# >>> dev-backup >>>$/,/^# <<< dev-backup <<<$/p' | sed 's/^/    /'
+  else
+    out "  · crontab 里没有受管区块"
+  fi
+  return 0
+}
+
+run_schedule() {
+  case "$SCHED_ACTION" in
+    install)
+      # 时间先校验一次：非法就退出 2，且什么都不写（dry-run 也不许输出半截计划）
+      sched_time_parts >/dev/null || return 2
+      sched_install ;;
+    uninstall) sched_uninstall ;;
+    status)    sched_status ;;
+    *) printf '未知动作：%s（用法：%s schedule install|uninstall|status）\n' "$SCHED_ACTION" "$PROG" >&2; return 2 ;;
+  esac
+}
+
+# ── 初始化 / 版本 ───────────────────────────────────────────────────────────
+run_init() {
+  local target="$CONF_FILE"
+  if [ -f "$target" ] && [ "$FORCE" != "1" ]; then
+    printf '配置文件已存在：%s（要覆盖加 --force）\n' "$target" >&2
+    return 2
+  fi
+  if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会写入：$target"; return 0; fi
+  mkdir -p "$(dirname "$target")" || { printf '无法创建 %s\n' "$(dirname "$target")" >&2; return 1; }
+  cat >"$target" <<'EOF'
+# dev-backup 配置文件：KEY=VALUE，一行一个；`#` 开头是注释。
+# 优先级：命令行 > 环境变量（DEV_BACKUP_* / DEV_ROOT）> 本文件 > 内置默认。
+# 键名可以写短名（ROOT）也可以写环境变量全名（DEV_ROOT）。
+
+# 要备份的「工作区根」：它下面第一层的 git 仓库会被打成 bundle（默认 ~/dev）
+ROOT=~/dev
+# 仓库搜索深度（默认 3）：工作区根往下找 .git 的层数
+# DEPTH=3
+
+# 备份目标目录（必填）：产物直接落在这里，同步客户端负责上传
+# 例：OneDrive / iCloud / Dropbox 的同步目录，或一块外置磁盘
+DEST=~/Backup/dev-backup
+
+# 日志与状态目录（默认 macOS: ~/Library/Logs/dev-backup；其他: ~/.local/state/dev-backup）
+# LOGDIR=~/.local/state/dev-backup
+
+# 每个目标保留多少个产物，更旧的轮转删除（默认 10）
+# KEEP=10
+
+# 非 git 顶层目录是否也打快照（默认 1）
+# SNAPSHOTS=1
+
+# 快照里是否包含 .env / .env.*（默认 0；这些都是明文密钥，不加密不推荐上云）
+# INCLUDE_ENV=0
+
+# 额外排除的文件/目录（空格分隔），叠加在内置排除表之上
+# EXCLUDES=*.iso .terraform
+
+# 工具配置白名单，格式 <标签>|<家目录>|<相对路径,相对路径>；默认 off（不猜你的 home）
+# 多份配置写成一行，用 `;` 分隔：
+# CONFIGS=editor|~/.config/my-editor|settings.json,keymap.json;shell|~/.config/fish|config.fish
+
+# 通知标题（macOS 用 osascript，Linux 用 notify-send；两者都没有时静默跳过）
+# NOTIFY_TITLE=dev-backup（工作区冷备）
+# 关掉桌面通知
+# NO_NOTIFY=1
+
+# 产物超过这么多秒还没上传就报「未上传」（默认 600；只有 macOS 的 mdls 能判）
+# UPLOAD_GRACE=600
+
+# --restore-drill 的输出目录（默认落在日志目录的 tmp/ 下）
+# DRILL_DIR=~/dev/_lab
+
+# --status 在 macOS 上提示 FDA 授权时，指给用户看的那个 app
+# FDA_APP=~/Applications/Backup.app
+
+# 定时任务的 label（仅 macOS launchd）
+# LABEL=com.dev-backup.daily
+EOF
+  out "  ✓ 已写入配置模板：$target"
+  out "    下一步：把 ROOT 与 DEST 改成你自己的路径，然后跑 ${PROG} --status"
+  return 0
+}
+
+run_version() {
+  # 第一行就是「名字 版本号」两个字段：脚本里 `awk 'NR==1{print $2}'` 就能取值
+  # （别把版本号和后面的中文挤成一个字段，那会让所有解析方都得多写一条正则）。
+  out "${PROG} ${VERSION}"
+  out "  契约 ${SCHEMA}    平台 ${UNAME_S}    配置文件 ${CONF_FILE}"
+}
+
+# ── 分派 ────────────────────────────────────────────────────────────────────
+case "$MODE" in
+  version)  run_version;  exit $? ;;
+  init)     run_init;     exit $? ;;
+  schedule) run_schedule; exit $? ;;
+  status)   if [ "$JSON_OUT" = "1" ]; then run_status_json; else run_status; fi; exit $? ;;
+  verify)   run_verify;   exit $? ;;
+  daily)    run_daily;    exit $? ;;
+  prune-orphans) run_prune_orphans; exit $? ;;
+  drill)    run_drill;    exit $? ;;
+  *)        run_backup ;;
+esac

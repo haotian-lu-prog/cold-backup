@@ -1,0 +1,44 @@
+name: ci
+
+# 真正的闸门：两个平台都跑一遍。macOS 上**必须**用 /bin/bash（3.2）跑，
+# 因为 macOS 的定时任务/ git 钩子常常就是它；本地开发终端里的 Homebrew bash 5 覆盖不到这个坑。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            note: Linux + GNU stat/date/sha256sum
+          - os: macos-latest
+            note: macOS + BSD stat/date/shasum, bash 3.2
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 语法检查
+        run: |
+          set -e
+          bash -n bin/dev-backup
+          bash -n install.sh
+          bash -n test/lint.sh
+          bash -n test/selftest.sh
+
+      - name: macOS 上再用系统 bash 3.2 检查一遍
+        if: runner.os == 'macOS'
+        run: /bin/bash -n bin/dev-backup
+
+      - name: 静态检查（跨平台陷阱 / 契约一致性 / 无个人路径）
+        run: bash test/lint.sh
+
+      - name: 端到端自测（只在临时目录里造数据）
+        run: bash test/selftest.sh
+
+      - name: macOS 上用 bash 3.2 再跑一遍端到端
+        if: runner.os == 'macOS'
+        run: /bin/bash test/selftest.sh
