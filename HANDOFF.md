@@ -25,6 +25,23 @@
 
 ## 当前状态
 
+**2026-10-02 追加（七）：修掉残留清理的「分组目录」误报，随 `1.0.3` 发布。**
+
+- 改名那轮在本机撞见：`--status` 每天提示「清理：`--prune-orphans --apply`」，
+  而被点名的 `repos/plugins` 下面装的正是六个插件的**活备份**（`repos/dsh` 同理，
+  下面是活目标 `dsh/notify-v2`）。根因是 `orphan_scan()` 只看 `$DEST/repos/*` 的**第一层**，
+  把分组目录也当成标签去比对。**`--apply` 是 `rm -rf`** —— 照工具自己的提示做就是删活产物。
+- 修法：`find` 递归枚举 + 判据「等于某个已知目标，或是某个已知目标产物路径的前缀 → 跳过」。
+  顺带把此前**根本列不出来**的嵌套真残留（`repos/plugins/dsh-dev-backup` 之类）纳入视野。
+- 验证：`test/lint.sh` 39/39、`test/selftest.sh` **222/222**（新增第 26 节，11 项断言）、
+  `test/frozen-clock.sh` **222/222**；**变异测试**（拿掉前缀判据）稳定红 6 项，
+  其中就有「⑤ 活产物被误删」——证明这条护栏真的拦得住。
+- 发布：`cold-backup@1.0.3`（本机 `npm publish`，无 provenance）+ Release `v1.0.3`，
+  asset 就是 registry 那一份（sha256 `18ab00491515d932ba037b941354c8eb32e590964cb001b04b073ea3e3dfd74c`）。
+- 本机私有脚本 `_shared/bin/backup-dev.sh` 同步修掉：真机 `--prune-orphans` 的 dry-run 里
+  两个假阳性消失、两个嵌套真残留浮出（详见 `_shared/HANDOFF.md`）。
+- `docs/compatibility.md` 写清嵌套标签与分组目录的判据，供下游自扫目录树时照抄。
+
 **2026-10-02 追加（六）：改名 —— CLI `dev-backup` → `cold-backup`（本轮，已发布）。**
 
 - 目录 `~/dev/dev-backup` → `~/dev/cold-backup`；可执行文件 `bin/dev-backup` → `bin/cold-backup`。
@@ -148,12 +165,13 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
-- [ ] **`1.0.3` 已就绪，正在发布**（`package.json` 与 `bin/cold-backup` 的 `VERSION` 都是 `1.0.3`；
-  lint 39/39、selftest **222/222**、frozen-clock **222/222**）。含两处修复：
-  ① `--init --dry-run` 不再在真实日志目录里建 `tmp/`；② 残留清理不再把**分组目录**当残留
-  （`--apply` 曾经会删掉嵌套目标下面活的产物）。发法：`npm publish --access public`
-  （本机 token，无 provenance），然后把 registry 那份 tarball 下载下来当 GitHub Release asset
-  （老规矩：asset == 已发布产物）。
+- [x] ~~**`1.0.3` 已就绪，正在发布**~~ → **已发布（2026-10-02）**：`dist-tags.latest = 1.0.3`，
+  registry `dist.shasum = bae4f119899d6ecbeae6b21832a0b2e8ffba4d44`。
+  Release `v1.0.3` 已建（tag → `c69d044`），asset `cold-backup-1.0.3.tgz` 就是 **registry 那一份**
+  （53545 字节，sha256 `18ab00491515d932ba037b941354c8eb32e590964cb001b04b073ea3e3dfd74c`）。
+  这一版 `npm pack` 与 registry **逐字节相同**（不再有 1.0.0~1.0.2 那种「字节不同、解包一致」的现象 ——
+  因为这次本机 npm 与发布时的 npm 就是同一个）。CI：`publish` 正确地跳过（版本已在 registry 上）
+  并 success，`ci` / `conventions` 也 success。
 - [ ] **（改名后新增，优先）新包名要各自再配一次 trusted publishing**：`cold-backup` 在 npm 上是
       **新包**，而 trusted publisher 是**按包**配的 —— 旧名 `dev-backup` 那份配置对新名字不生效，
       所以 CI 的 `publish.yml` 现在发不出去（`PUT` 404）。配法：npm → `cold-backup` →
