@@ -637,7 +637,8 @@ else
   chmod 500 "$DEV_BACKUP_DEST/repos/ghost-ro"
   "$BIN" --prune-orphans --apply >/dev/null 2>&1; rc=$?
   eq "--apply 遇到删不掉的残留时退出码" "$rc" "1"
-  [ -d "$DEV_BACKUP_DEST/repos/ghost-ro" ] && ok "删不掉的残留仍在（没有假装成功）" || ok "残留被删掉了（那也该报 0）"
+  [ -d "$DEV_BACKUP_DEST/repos/ghost-ro" ] && ok "删不掉的残留仍在（没有假装成功）" \
+    || no "报了 1 但残留并不在（退出码解释不通）"
   chmod 700 "$DEV_BACKUP_DEST/repos/ghost-ro" 2>/dev/null
   rm -rf "$DEV_BACKUP_DEST/repos/ghost-ro"
   "$BIN" --prune-orphans --apply >/dev/null 2>&1; eq "清掉只读残留后恢复退出 0" "$?" "0"
