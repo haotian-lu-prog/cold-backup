@@ -4,9 +4,13 @@
 
 ## 当前写者
 
-- 工具：（空 —— 2026-10-02 DSH 会话已收工：仓库公开 + npm 首发 + CI 两平台全绿）
+- 工具：（空 —— 2026-10-02 DSH 会话已收工：**1.0.1 两个防护 + 走 trusted publishing 首发验证**）
 - 分支：main
 - 开始时间：—
+- 本轮：① 新增两个防护（都是 1.0.0 发布后实测出来的）：**`DEST` 不许落在工作区里**（会自我繁殖：
+  快照把上一轮产物打进去，实测 3 轮 3194 → 6945 → 14110 字节）、**`schedule install --program`
+  不可执行时当场警告**（否则任务每天静默失败）。② 用 1.0.1 验证 trusted publishing：
+  Release → CI 直接发布、带 provenance，不再需要本机 npm 登录。
 
 > 一个仓库同一时刻只允许一个写者。交接时把上一行改成自己，并先读完下面的状态。
 
@@ -58,6 +62,17 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 | 伪 Linux（`uname` 桩）跑非 Darwin 分支 | 194 通过 / 0 失败 / 2 跳过（mdls 与 FDA 探针，跳过被计数报出） |
 | 无 `crontab` 的 PATH 下跑 `schedule --dry-run` | rc=0 且照常打印受管区块；真装才 rc=1 |
 
+**2026-10-02 追加（1.0.1）：两个防护 + 发版链路验证**
+
+- **`DEST` 落在工作区里 → 备份直接拒绝**（退出 1、不写任何产物、明说原因）：`SNAPSHOTS=1` 时
+  快照会把上一轮的产物打进去、逐轮翻倍（实测 3 轮 3194 → 6945 → 14110 字节）；`DEST == ROOT` 一并拒绝。
+  判定用规范化路径前缀（`canon_path`：存在的走 `pwd -P`，不存在的用「规范化父目录 + 名字」），
+  `/tmp` 与 `/private/tmp` 这类软链写法不会被误判。
+- **`schedule install --program <不可执行>` → 当场警告**（`--dry-run` 也警告）。只警告不失败 ——
+  「先装任务、稍后再构建程序」是合理用法，但「每天静默失败」必须说出来。
+- 自测 **210 项 / 0 失败 / 0 跳过**（新增第 25 节 9 项断言）；`test/lint.sh` 37 项。
+- 1.0.1 走 **trusted publishing** 发布（不进 staging、带 provenance），见「下一步」第一条。
+
 **CI**：两个平台都跑通了 —— `ubuntu-latest` 16s、`macos-latest` 1m17s（后者再用 `/bin/bash` 3.2
 复跑一遍）。Linux 的 GNU 兼容层由此第一次得到真实验证（本机没有 Linux 环境，只有 CI）。
 
@@ -66,8 +81,9 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
-- [ ] **给 npm 配 trusted publishing**（下次发版走 GitHub Release → `publish.yml` → 带 provenance）。
-      首发是本机 `npm publish` 发的，没有 provenance；配法写在 `.github/workflows/publish.yml` 顶部注释里。
+- [x] ~~**给 npm 配 trusted publishing**~~ → **用户已在 npm 侧配好**（2026-10-02），
+      并由 **1.0.1** 走通：GitHub Release → `publish.yml` → 直接发布、带 provenance，无需本机 npm 登录。
+      以后发版就是「bump version → tag → Release」三步。
 - [ ] 用一段时间后，再评估要不要把**本机**冷备切到这个 CLI（本次用户明确决定保持现状，
       接口与产物契约没变，切换成本已被压到一个 5 行薄壳）。
 - [ ] 若切换：`_shared/bin/backup-dev.sh` 换成 `exec dev-backup --config ~/dev/_shared/backup-dev.conf "$@"`，
