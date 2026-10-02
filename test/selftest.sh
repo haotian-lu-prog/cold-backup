@@ -770,6 +770,53 @@ case "$out" in
   *) ok "⑤ 可执行文件不误报" ;;
 esac
 
+hdr "26 残留清理：嵌套标签的**分组目录**不是残留（--apply 不许删活产物）"
+
+# 标签里带 `/` 的目标（工作区子目录里的仓库，如 `plugins/nested-demo`）在备份目录里是**嵌套**的：
+# 产物在 `repos/plugins/nested-demo`，而 `repos/plugins` 只是分组目录。
+# 旧实现只枚举第一层，把 `repos/plugins` 当成一个标签去比对 → 必然失配 → 报成「残留」；
+# 而 `--apply` 是 `rm -rf` —— 照着自己印出来的提示执行，就把下面**活的产物**一起删了
+# （真机实测：`repos/plugins` 下是六个插件的全部备份）。所以这一节守两件事：
+#   ① 分组目录绝不能被当成残留（更不能被删）；
+#   ② 嵌套的**真残留**仍然要被抓出来并清掉（改名/删除目标留下的那种），不能因为修 ① 就漏 ②。
+nested_ws="$W/nested-ws"; nested_dest="$W/nested-dest"; nested_log="$W/nested-logs"
+mkdir -p "$nested_ws/plugins/nested-demo" "$nested_ws/flat-demo"
+for d in "$nested_ws/plugins/nested-demo" "$nested_ws/flat-demo"; do
+  ( cd "$d" && git init -q && git config user.email t@t && git config user.name t \
+    && printf 'x\n' >a.txt && git add -A && git commit -qm init ) >/dev/null 2>&1
+done
+nested_run() { COLD_BACKUP_CONFIG="$W/no-such-config" "$BIN" \
+  --root "$nested_ws" --dest "$nested_dest" --logdir "$nested_log" "$@"; }
+
+nested_run --trigger=selftest >/dev/null 2>&1; eq "① 嵌套工作区备份退出码" "$?" "0"
+[ -d "$nested_dest/repos/plugins/nested-demo" ] && ok "① 产物落在嵌套目录下（repos/plugins/nested-demo）" \
+  || no "① 没产生嵌套产物"
+[ -d "$nested_dest/repos/flat-demo" ] && ok "① 扁平目标照常" || no "① 扁平目标没备上"
+
+out="$(nested_run --prune-orphans 2>&1)"
+if contains "$out" '待删 repos/plugins（'; then
+  no "② 分组目录 repos/plugins 被误报成残留（--apply 会删掉下面活的产物）"
+else
+  ok "② 分组目录不被当成残留"
+fi
+json="$(nested_run --status --json 2>/dev/null)"
+contains "$(jline "$json" orphans)" '[]' && ok "③ JSON orphans[] 为空" \
+  || no "③ orphans 不是空：$(jline "$json" orphans)"
+
+mkdir -p "$nested_dest/repos/plugins/ghost-nested"
+printf 'x' >"$nested_dest/repos/plugins/ghost-nested/x.bundle"
+out="$(nested_run --prune-orphans 2>&1)"
+contains "$out" 'repos/plugins/ghost-nested' && ok "④ 嵌套的真残留仍被列出（没因为修 ② 而漏报）" \
+  || no "④ 嵌套的真残留漏了：$(printf '%s\n' "$out" | tail -3)"
+
+nested_run --prune-orphans --apply >/dev/null 2>&1; eq "⑤ --apply 退出码" "$?" "0"
+[ -d "$nested_dest/repos/plugins/ghost-nested" ] && no "⑤ 嵌套残留没清掉" || ok "⑤ 嵌套残留已清掉"
+[ -d "$nested_dest/repos/plugins/nested-demo" ] && ok "⑤ 活产物目录（嵌套目标）还在" \
+  || no "⑤ 活产物被误删"
+[ -n "$(ls -1 "$nested_dest/repos/plugins/nested-demo"/*.bundle 2>/dev/null)" ] \
+  && ok "⑤ 活产物的文件仍在" || no "⑤ 活产物的文件没了"
+[ -d "$nested_dest/repos/flat-demo" ] && ok "⑤ 扁平目标也没被误删" || no "⑤ 扁平目标被误删"
+
 printf '\n== 自测结果：%d 项通过，%d 项失败，%d 项跳过\n' "$pass" "$fail" "$skipped"
 printf '   （临时目录已清理：%s）\n' "$W"
 [ "$fail" -eq 0 ] || exit 1

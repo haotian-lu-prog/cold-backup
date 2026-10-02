@@ -9,6 +9,34 @@
 
 ---
 
+## 2026-10-02 — 残留清理：**分组目录**不再算残留（否则 `--apply` 会删掉活产物）
+
+- **背景**（改名那轮在本机撞见的）：标签里带 `/` 的目标（工作区子目录里的仓库，如
+  `~/dev/plugins/dsh-cold-backup` → 标签 `plugins/dsh-cold-backup`）在备份目录里是**嵌套**的：
+  产物在 `<DEST>/repos/plugins/dsh-cold-backup`。而 `orphan_scan()` 只枚举 `$DEST/repos/*`
+  的**直接**子目录 —— 于是 `repos/plugins` 被当成一个标签去比对，必然匹配不上任何已知标签，
+  就被报成「残留」。
+- **危害**：`--status` 把它列进 `orphans[]`，还附一句「清理：`--prune-orphans --apply`」；
+  而 `--apply` 执行的是 `rm -rf "$DEST/$rel"` —— **照着工具自己给的提示做，就会把
+  `repos/plugins` 下面所有插件的活备份删掉**（本机实测：6.6 MB、六个插件）。
+  同一形态还误报了 `repos/dsh`（它下面是活目标 `dsh/notify-v2` 的产物目录）。
+- **选项**：A 只把「是已知目标产物路径前缀」的目录跳过；B 改成递归枚举 + 前缀判据；
+  C 不改代码，只在文档里写「有嵌套标签的工作区别用 `--apply`」。
+- **结论**：**B**。A 会把嵌套的**真残留**（例如 `repos/plugins/dsh-dev-backup` —— 插件改名后
+  正该清掉的那份）永久藏起来；C 等于把工具的 bug 降级成用户的注意事项，而那条提示每天都弹。
+  实现：`orphan_scan()` 改为 `find "$DEST/<kind>" -mindepth 1 -type d` 递归枚举，
+  候选目录只要「等于某个已知目标」或「是某个已知目标产物路径的前缀」就跳过。
+- **保守之处（有意的）**：若「`plugins` 自己也是目标」且它消失了、而 `plugins/foo` 还在，
+  `repos/plugins` 顶层的陈旧产物不会被列为残留 —— **宁可漏报，也不误删**，这是备份工具的底线。
+- **验证**：自测新增第 26 节（11 项断言）；变异测试（把前缀判据拿掉）稳定红 6 项，
+  其中一项就是「⑤ 活产物被误删」—— 说明这条护栏真的拦得住这个 bug。
+- **本机私有脚本同步修掉**（同一份逻辑）：真机 `--prune-orphans` 的 dry-run 从
+  「7 个待删」变成「7 个待删」——**但成分变了**：两个会误删活产物的假阳性消失，
+  两个此前看不见的嵌套真残留（`repos/plugins/dsh-archived-sessions-manager`、
+  `repos/plugins/dsh-dev-backup`）浮出来。
+
+---
+
 ## 2026-10-02 — 改名：`dev-backup` → `cold-backup`、`dsh-dev-backup` → `dsh-cold-backup`
 
 - **背景**：这两个名字里的 `dev` 既不准确也不自解释 —— 「dev-backup」读起来像「开发用的备份」，

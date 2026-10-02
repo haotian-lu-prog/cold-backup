@@ -1144,23 +1144,37 @@ run_status_json() {
 orphan_scan() { # $1=（可选）已知目标清单「类型|标签」多行；$2=orphan|foreign
   local known="${1:-}" want="${2:-orphan}"
   [ -n "$known" ] || known="$(list_targets | cut -f1,2 | tr '\t' '|')"
-  local dir rel kind label cls
-  for dir in "$DEST/repos"/* "$DEST/snapshots"/* "$DEST/configs"/*; do
-    [ -d "$dir" ] || continue
-    rel="${dir#"$DEST"/}"
-    case "$rel" in
-      repos/*)     kind="repo";     label="${rel#repos/}" ;;
-      snapshots/*) kind="snapshot"; label="${rel#snapshots/}" ;;
-      configs/*)   kind="config";   label="${rel#configs/}" ;;
-      *) continue ;;
+  local base kind dir rel label cls
+  # 递归枚举，而不是只看第一层：标签里带 `/` 的目标（工作区子目录里的仓库，如 `plugins/foo`）
+  # 在备份目录里是**嵌套**的（`repos/plugins/foo`），所以「哪些目录是目标目录」不止一层。
+  #
+  # 只看第一层的旧写法会把**分组目录**（`repos/plugins`）当成一个标签去比对 —— 它当然匹配不上
+  # 任何标签，于是被报成「残留」。而 `--prune-orphans --apply` 是 `rm -rf`：照着自己给出的提示
+  # 执行，就会把分组目录下面**活的产物**一起删掉（真机上实测：`repos/plugins` 下是六个插件的
+  # 全部备份）。判据补一条：候选目录若是任何已知目标产物路径的**前缀**，它只是分组目录，跳过。
+  #
+  # 保守之处：若某天「`plugins` 自己也是目标」且它消失了、而 `plugins/foo` 还在，那么
+  # `repos/plugins` 顶层的陈旧产物不会被列为残留。宁可漏报也不误删 —— 这是备份工具的底线。
+  for base in repos snapshots configs; do
+    [ -d "$DEST/$base" ] || continue
+    case "$base" in
+      repos)     kind="repo" ;;
+      snapshots) kind="snapshot" ;;
+      configs)   kind="config" ;;
     esac
-    printf '%s\n' "$known" | grep -Fxq "${kind}|${label}" && continue
-    cls="$(owner_class "$rel")"
-    if [ "$want" = "foreign" ]; then
-      [ "$cls" = "foreign" ] && printf '%s\n' "$rel"
-    else
-      [ "$cls" = "foreign" ] || printf '%s\n' "$rel"
-    fi
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      rel="${dir#"$DEST"/}"
+      label="${rel#"$base"/}"
+      printf '%s\n' "$known" | grep -Fxq "${kind}|${label}" && continue   # 就是目标本身
+      printf '%s\n' "$known" | grep -Fq "${kind}|${label}/" && continue   # 分组目录（下面是活目标）
+      cls="$(owner_class "$rel")"
+      if [ "$want" = "foreign" ]; then
+        [ "$cls" = "foreign" ] && printf '%s\n' "$rel"
+      else
+        [ "$cls" = "foreign" ] || printf '%s\n' "$rel"
+      fi
+    done < <(find "$DEST/$base" -mindepth 1 -type d 2>/dev/null | LC_ALL=C sort)
   done
 }
 

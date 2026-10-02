@@ -60,7 +60,7 @@
 | `verdict` | `"ok"` \| `"bad"` | 与退出码一致。**只有这两个值**（加第三档会让老消费者静默丢弃整份文档） |
 | `lastOk` | epoch 秒 \| null | 最近一次**成功**的备份时间 |
 | `lastFailure` | object \| null | `{epoch, trigger, message}`，最近一次失败记录 |
-| `orphans` | string[] | 已不对应任何目标的残留目录（相对 `dest`）。**不含**属于别的工作区的目录 |
+| `orphans` | string[] | 已不对应任何目标的残留目录（相对 `dest`）。**不含**属于别的工作区的目录；**也不含**分组目录（见 §4 的嵌套标签说明） |
 | `reasons` | array | `{code, target, message}`；`code` 是机器可读的英文标识，`message` 是给人看的中文 |
 | `targets` | array | 每个目标一条，见下 |
 | `counts` | object | `{repos, snapshots, configs, problems, orphans}` |
@@ -118,6 +118,11 @@
   「秒相同、只差 sha 后缀」的**并列**产物 —— 此时「按文件名取最新」是不可判定的，
   消费方**不要**依赖并列时的顺序。（工具自己也不依赖：`--status` 判断的是「**HEAD 的 sha**
   那一份在不在」，不是「文件名最大的那份」。）
+- **标签里带 `/` 的目标是嵌套的**（工作区子目录里的仓库，如 `plugins/foo` → 产物在
+  `<DEST>/repos/plugins/foo/`）。于是 `repos/plugins` 这种**中间层只是分组目录，不是目标**，
+  也不该被当成残留：判据是「它是不是某个已知目标产物路径的前缀」。
+  消费方若自己扫这个目录树，请照同一条规矩来 —— 把分组目录当残留删掉，等于删掉下面所有目标的
+  活产物（1.0.3 之前本工具就踩过这个坑，见 `decisions.md`）。
 - `<DEST>/repos|snapshots|configs/<标签>/.cold-backup-owner` —— 归属标记，内容是工作区 ID。
   **不是**产物，不要当产物校验，也不要在没有把握时删它。
 - `<DEST>/manifests/*.tsv` —— 8 列 `epoch / kind / label / sha / count / file / bytes / sha256`。

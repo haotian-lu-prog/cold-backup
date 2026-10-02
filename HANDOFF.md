@@ -148,12 +148,12 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
-- [ ] **`1.0.3` 已经 bump 好但*还没发***（`package.json` 与 `bin/cold-backup` 的 `VERSION` 都是
-      `1.0.3`，lint 39/39、selftest 211/211）。它目前只含那个 `--init --dry-run` 修复。
-      压着不发的原因：若决定一并修「残留清理误报」（见「未决问题」第一条），两处应当同一个版本
-      发出去 —— 拆成 1.0.3 / 1.0.4 对消费者没有意义。发法：`npm publish --access public`
-      （本机 token，无 provenance），然后把 registry 那份 tarball 下载下来当 GitHub Release
-      asset（老规矩：asset == 已发布产物）。
+- [ ] **`1.0.3` 已就绪，正在发布**（`package.json` 与 `bin/cold-backup` 的 `VERSION` 都是 `1.0.3`；
+  lint 39/39、selftest **222/222**、frozen-clock **222/222**）。含两处修复：
+  ① `--init --dry-run` 不再在真实日志目录里建 `tmp/`；② 残留清理不再把**分组目录**当残留
+  （`--apply` 曾经会删掉嵌套目标下面活的产物）。发法：`npm publish --access public`
+  （本机 token，无 provenance），然后把 registry 那份 tarball 下载下来当 GitHub Release asset
+  （老规矩：asset == 已发布产物）。
 - [ ] **（改名后新增，优先）新包名要各自再配一次 trusted publishing**：`cold-backup` 在 npm 上是
       **新包**，而 trusted publisher 是**按包**配的 —— 旧名 `dev-backup` 那份配置对新名字不生效，
       所以 CI 的 `publish.yml` 现在发不出去（`PUT` 404）。配法：npm → `cold-backup` →
@@ -187,23 +187,27 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 未决问题
 
-- **⚠ 残留清理有误报，照着提示 `--prune-orphans --apply` 会删掉活的产物**（2026-10-02 改名时在本机
-  撞见，可复现；**未修**，等决定）。`orphan_scan()` 只枚举 `$DEST/repos/*` 的**直接**子目录，
-  把 `repos/plugins` 这种「分组目录」也当成一个标签去比对；而标签里带 `/` 的目标
-  （如 `plugins/foo`）在备份目录里是**嵌套**的，它的父目录必然匹配不上任何已知标签，
-  于是被报成残留。复现（不到 30 秒）：
+- [x] ~~**⚠ 残留清理有误报，照着提示 `--prune-orphans --apply` 会删掉活的产物**~~ →
+  **2026-10-02 当日已修**，随 `1.0.3` 发布。根因：`orphan_scan()` 只枚举 `$DEST/repos/*` 的
+  **直接**子目录，把 `repos/plugins` 这种分组目录也当成标签去比对；而标签带 `/` 的目标
+  （如 `plugins/foo`）在备份目录里是**嵌套**的，父目录必然匹配不上 → 被报成残留。
+  修法：`find` 递归枚举 + 判据「等于某个已知目标，或是某个已知目标产物路径的**前缀** → 跳过」。
+  自测新增第 26 节（11 项断言）；变异测试（拿掉前缀判据）稳定红 6 项，其中就有「⑤ 活产物被误删」。
+  本机私有脚本 `_shared/bin/backup-dev.sh` 同步修掉：真机 `--prune-orphans` 的 dry-run 里
+  两个会误删活产物的假阳性（`repos/plugins`、`repos/dsh`）消失，同时浮出两个此前看不见的
+  嵌套真残留（`repos/plugins/dsh-{archived-sessions-manager,dev-backup}`）。
+  **下面保留原始的复现与影响记录，免得下次又当成新发现**：
+  旧 `orphan_scan()` 的枚举方式是 `for dir in "$DEST/repos"/* ...`（只看第一层）。
+  复现（不到 30 秒）：
   ```sh
   W=$(mktemp -d); mkdir -p "$W/ws/plugins/foo"
   (cd "$W/ws/plugins/foo" && git init -q && git -c user.email=t@t -c user.name=t commit -qm x --allow-empty)
   bin/cold-backup --root "$W/ws" --dest "$W/dest" --logdir "$W/logs" --trigger=t   # 备份
   bin/cold-backup --root "$W/ws" --dest "$W/dest" --logdir "$W/logs" --prune-orphans
-  #   · 待删 repos/plugins   ← 它下面装的正是 plugins/foo 的**活产物**
+  #   旧行为：· 待删 repos/plugins   ← 它下面装的正是 plugins/foo 的**活产物**
+  #   新行为：✓ 没有残留目录
   ```
-  本机就是这样：`~/dev/plugins/*` 六个插件的备份全在 `repos/plugins/` 下，而 `--status`
-  每天都在提示「清理：`--prune-orphans --apply`」。**修好之前不要跑 `--apply`。**
-  修法（备选，未实施）：候选目录若为任何已知目标产物路径的**前缀**，就按分组目录跳过；
-  同时改成递归枚举，好让 `repos/plugins/<已改名的旧目标>` 这种**嵌套的真残留**照样能被列出。
-  自测只覆盖了扁平标签（`repos/ghost-ro` 那些），所以这个洞一直没红 —— 补测试时要用嵌套标签。
+  1.0.2 及更早的版本在嵌套标签的工作区上**不要**跑 `--prune-orphans --apply`。
 - **npm trusted publishing（本包）尚未生效**：CI 的 `npm publish` 报 `PUT` 404，排查清单见
   「下一步」第一条。在它修好之前，发版必须走本机 `npm publish`（**无 provenance**）——
   1.0.1 就是这么发的。
