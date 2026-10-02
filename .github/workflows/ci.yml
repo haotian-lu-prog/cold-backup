@@ -28,6 +28,7 @@ jobs:
           bash -n install.sh
           bash -n test/lint.sh
           bash -n test/selftest.sh
+          bash -n test/frozen-clock.sh
 
       - name: macOS 上再用系统 bash 3.2 检查一遍
         if: runner.os == 'macOS'
@@ -42,3 +43,13 @@ jobs:
       - name: macOS 上用 bash 3.2 再跑一遍端到端
         if: runner.os == 'macOS'
         run: /bin/bash test/selftest.sh
+
+      # 冻结时钟：把产物名里的 UTC 时间戳钉成同一个值，强制制造「同一秒内为多个提交各备一次」
+      # 的并列情况。真实机器上这是时序巧合（ubuntu 够快会撞上、macOS 不会），
+      # 于是「按名取最新」这类假设只在 CI 上抽签式地红 —— 这一步把那巧合变成常态。
+      - name: 冻结时钟压力测试（同秒并列成为常态）
+        run: bash test/frozen-clock.sh
+
+      - name: macOS 上再用 bash 3.2 跑一遍冻结时钟
+        if: runner.os == 'macOS'
+        run: /bin/bash test/frozen-clock.sh

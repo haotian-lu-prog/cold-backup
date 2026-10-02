@@ -33,7 +33,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 2
 fi
 
-VERSION="1.0.1"
+VERSION="1.0.2"
 SCHEMA="dev-backup.status/1"
 PROG="${DEV_BACKUP_PROG:-$(basename "$0")}"
 SELF="$0"
@@ -421,6 +421,17 @@ list_repos() { # 输出「仓库绝对路径<TAB>标签」；标签=相对路径
 # 进而让 --status 误报落后、--verify 去验旧产物、--restore-drill 拿旧 bundle 演练。
 newest_of()     { ls -1 "$1"/$2 2>/dev/null | sort | tail -1; }
 newest_bundle() { newest_of "$1" '*.bundle'; }
+
+# 某个仓库在备份目录里对应 **HEAD** 的那份 bundle（没有就返回空）。
+# 为什么要单独一个函数：产物名里的时间戳只有秒精度，同一秒内为两个提交各备一次时并列，
+# 「按名取最新」此时不可判定 —— 校验/演练若抓成旧提交那份，会把一次完好的备份报成「不一致」。
+# （冻结时钟压力测试 test/frozen-clock.sh 稳定复现过。）
+head_bundle_of() { # $1=源仓库路径 $2=标签
+  local sha
+  sha="$(git -C "$1" rev-parse --short=12 HEAD 2>/dev/null)" || return 0
+  [ -n "$sha" ] || return 0
+  ls -1 "$DEST/repos/$2"/*-"$sha".bundle 2>/dev/null | sort | tail -1
+}
 newest_snapshot() { newest_of "$1" '*.tar.gz'; }
 
 sidecar_ok() { # $1=产物；.sha256 存在且匹配才算通过。缺失 = 不可信，绝不是「通过」。
@@ -464,12 +475,20 @@ fda_hint() { # 只在 macOS 的受保护目录上才谈授权；其他平台说�
 }
 
 # ── 备份 ────────────────────────────────────────────────────────────────────
-prune() { # $1=目录 $2=通配；保留最新 KEEP 个（按文件名排序，mtime 被云盘改写也不会删错）
-  local d="$1" pat="$2" n=0 f
+prune() { # $1=目录 $2=通配 $3=（可选）本次刚写出的产物：无论排序如何都**不许删**
+  #
+  # 为什么需要第 3 个参数：产物名里的时间戳只有**秒**精度，同一秒内为两个提交各备一次时并列，
+  # 「按名排序」退化成按 sha 后缀排 —— 刚写出的那份可能排进「较旧」的一侧，被这一轮自己删掉，
+  # 而调用方刚刚才报告「备份成功」。冻结时钟压力测试（test/frozen-clock.sh）稳定复现了它。
+  local d="$1" pat="$2" keep_this="${3:-}" n=0 f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     n=$((n + 1))
     [ "$n" -le "$KEEP" ] && continue
+    if [ -n "$keep_this" ] && [ "$f" = "$keep_this" ]; then
+      log "轮转跳过本次新产物 $(basename "$f")（并列排序下它落在 KEEP 之外）"
+      continue
+    fi
     if rm -f "$f" "$f.sha256" 2>/dev/null; then
       log "轮转删除 $(basename "$f")"
     else
@@ -538,7 +557,7 @@ backup_repo() { # $1=仓库路径 $2=标签
   run_manifest_add "$(printf '%s\trepo\t%s\t%s\t%s\t%s\t%s\t%s' "$(date +%s)" "$label" "$sha" "$count" "$final" "$bytes" "$sum")"
   log "备份 ${label}：${final}（$count 提交，$bytes 字节）"
   out "  ✓ $label  →  ${final}（$count 提交，$bytes 字节）"
-  prune "$d" '*.bundle'
+  prune "$d" '*.bundle' "$d/$final"
 }
 
 snapshot_excludes() {
@@ -592,7 +611,7 @@ store_snapshot_file() { # $1=标签 $2=目标目录 $3=临时 tar.gz $4=类型�
   run_manifest_add "$(printf '%s\t%s\t%s\t-\t-\t%s\t%s\t%s' "$(date +%s)" "$kind" "$label" "$final" "$bytes" "$sum")"
   log "${kind} ${label}：${final}（${bytes} 字节）"
   out "  ✓ $label  →  ${final}（${bytes} 字节）"
-  prune "$d" '*.tar.gz'
+  prune "$d" '*.tar.gz' "$d/$final"
 }
 
 # ── 工具配置冷备（白名单，可选）──────────────────────────────────────────────
@@ -1223,7 +1242,8 @@ run_verify() {
     [ -n "${label:-}" ] || continue
     case "$kind" in
       repo)
-        b="$(newest_bundle "$DEST/repos/$label")"
+        b="$(head_bundle_of "$src" "$label")"
+        [ -n "$b" ] || b="$(newest_bundle "$DEST/repos/$label")"
         if [ -z "$b" ]; then out "  ✗ ${label}：没有任何 bundle"; rc=1; continue; fi
         n=0
         for f in "$DEST/repos/$label"/*.bundle; do
@@ -1289,7 +1309,10 @@ run_drill() { # 真还原：镜像 clone 每个最新 bundle，比对全部 ref 
   while IFS="$(printf '\t')" read -r kind label src; do
     [ "$kind" = "repo" ] || continue
     [ -n "${label:-}" ] || continue
-    b="$(newest_bundle "$DEST/repos/$label")"
+    # 优先还原 **HEAD 那一份**（判据见 head_bundle_of）：演练是拿还原结果与源仓库比对，
+    # 抓错产物会把「完好的备份」报成不一致。HEAD 还没备上时才退回最新那份。
+    b="$(head_bundle_of "$src" "$label")"
+    [ -n "$b" ] || b="$(newest_bundle "$DEST/repos/$label")"
     [ -n "$b" ] || { out "  ✗ ${label}：没有 bundle"; rc=1; continue; }
     # ① 镜像还原：bundle 当远端，refs/* 全量还原。
     #    注意普通 clone 只会带 refs/heads 与 tags，refs/original/*（filter-branch 旧历史）、
