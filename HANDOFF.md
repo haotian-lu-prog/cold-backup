@@ -73,8 +73,11 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 - [ ] 若切换：`_shared/bin/backup-dev.sh` 换成 `exec dev-backup --config ~/dev/_shared/backup-dev.conf "$@"`，
       个人约定（`ROOT`/`DEST`/`CONFIGS`/`LOGDIR`/`NOTIFY_TITLE`）搬进那份配置文件；改完必须验证
       「`git commit` 一次 → `$DEST/manifests/` 出现新 tsv、`--status` 退 0、插件与面板仍能读到 JSON」。
-- [ ] 上游联动（可选）：`dsh-dev-backup` 插件 README 里 `statusJsonCommand` 的示例仍指向
-      `~/dev/_shared/bin/backup-dev.sh --status --json`；本机不切换的话它依然正确，不用改。
+- [x] ~~上游联动：`dsh-dev-backup` 插件 README 里 `statusJsonCommand` 的示例指向私有路径~~ →
+      已随 **`dsh-dev-backup@1.1.1`** 发布：示例改成 `dev-backup --status --json`，
+      中英 README 都新增了「与 dev-backup 的关系」（它不是必需的、两边互相独立），
+      并写清「本插件的默认文件路径**就是**本 CLI 在 macOS 上的默认日志目录 —— 装两边一个字段都不用改」。
+      插件侧记录见该仓库 `HANDOFF.md` 的「当前状态（五）」。
 
 ## 未决问题
 
