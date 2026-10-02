@@ -1410,12 +1410,13 @@ sched_install() {
     fi
     return 0
   fi
-  have crontab || { printf '本机没有 crontab 命令（Linux 上装 cron 或改用 systemd timer）\n' >&2; return 1; }
+  # dry-run 只打印计划，**不依赖系统里有没有 crontab**（容器 / 纯 systemd 的机器上也要能看计划）
   if [ "$DRY_RUN" = "1" ]; then
     out "（dry-run）会把下面这段写进 crontab："
     cron_block
     return 0
   fi
+  have crontab || { printf '本机没有 crontab 命令（Linux 上装 cron 或改用 systemd timer）\n' >&2; return 1; }
   local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
   { cron_without_block; cron_block; } >"$candidate" || { rm -f "$candidate"; return 1; }
   crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败（原 crontab 未改动）\n' >&2; return 1; }
@@ -1439,8 +1440,8 @@ sched_uninstall() {
     out "  ✓ 已卸载 launchd 任务 ${SCHED_LABEL}"
     return 0
   fi
-  have crontab || { printf '本机没有 crontab 命令\n' >&2; return 1; }
   if [ "$DRY_RUN" = "1" ]; then out "（dry-run）会从 crontab 里删掉受管区块"; return 0; fi
+  have crontab || { printf '本机没有 crontab 命令\n' >&2; return 1; }
   local candidate; candidate="$(mktemp "${TMPDIR:-/tmp}/dev-backup-cron.XXXXXX")" || return 1
   cron_without_block >"$candidate" || { rm -f "$candidate"; return 1; }
   crontab "$candidate" || { rm -f "$candidate"; printf '✗ 写入 crontab 失败\n' >&2; return 1; }
