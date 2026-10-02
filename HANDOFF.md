@@ -172,14 +172,23 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
   这一版 `npm pack` 与 registry **逐字节相同**（不再有 1.0.0~1.0.2 那种「字节不同、解包一致」的现象 ——
   因为这次本机 npm 与发布时的 npm 就是同一个）。CI：`publish` 正确地跳过（版本已在 registry 上）
   并 success，`ci` / `conventions` 也 success。
-- [ ] **（改名后新增，优先）新包名要各自再配一次 trusted publishing**：`cold-backup` 在 npm 上是
-      **新包**，而 trusted publisher 是**按包**配的 —— 旧名 `dev-backup` 那份配置对新名字不生效，
-      所以 CI 的 `publish.yml` 现在发不出去（`PUT` 404）。配法：npm → `cold-backup` →
-      Settings → Trusted Publisher → GitHub Actions，user `haotian-lu-prog` / repo `cold-backup` /
-      workflow `publish.yml` / Environment **留空**，并选 **allow publish**（不要选 stage publish）。
-      配好之前发版仍走本机 `npm publish`（无 provenance）—— `cold-backup@1.0.2` 就是这么发的。
-      插件侧同理（`dsh-cold-backup`），见那个仓库的 HANDOFF。
-- [ ] **trusted publishing 没匹配上，待查**（用户已在 npm 侧建过配置）：CI 的 `publish.yml` 跑到
+- [x] ~~**（改名后新增，优先）新包名要各自再配一次 trusted publishing**~~ → **2026-10-03 已配好并核对**：
+  用户用网页配好两份，`npm trust list`（经 2FA）读回来都是
+  `type: github / file: publish.yml / repository: haotian-lu-prog/cold-backup /
+  permissions: publish, stage publish` —— 与工作流文件逐项对得上。插件侧那份同理
+  （`haotian-lu-prog/dsh-cold-backup`）。旧包的两份配置已删除（`npm trust list dev-backup`
+  → `E404`，即「没有配置」）。
+  **但 OIDC 发布这条路还没被真实发版验过**（`workflow_dispatch` 会在「版本已在 registry 上」时
+  跳过 publish 步骤，测不到 token 交换）—— 下一次发版即验证。
+- [x] ~~**这个账号上的 bypass-2FA token 已无用**~~ → **已撤销**（2026-10-03）：
+  `npm token revoke 371aff`（`dsh-dev publish`，2026-09-30 建）成功，`npm token list` 现在为空，
+  用备份里的旧值实测 `npm whoami` → **401**。本机 `~/.npmrc` 现在是网页登录会话 token
+  （读操作照常，写操作每次要过一次浏览器 2FA —— 所以正常发版请走 CI 的 OIDC）。
+- [x] ~~**trusted publishing 没匹配上，待查**~~ → **作废（2026-10-03）**：这条清单针对的是
+      **旧包名 `dev-backup`**；改名后新包 `cold-backup` 已单独配好 OIDC（见上一条），
+      旧包已 deprecate、其 trusted publisher 也已删除（`npm trust list dev-backup` → `E404`）。
+      原文保留只为查档：
+      CI 的 `publish.yml` 跑到
       `npm publish` 那步报 `E404 PUT https://registry.npmjs.org/dev-backup`（npm 用 404 表示
       「不匹配 / 无权限」）。工作流本身与**已能成功发布**的 `dsh-dev-backup` 那份结构一致
       （`id-token: write`、无 `environment:`、`node-version: 24`、同样的 `npm publish` 命令），
