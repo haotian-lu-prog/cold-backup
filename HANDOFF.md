@@ -4,17 +4,18 @@
 
 ## 当前写者
 
-- 工具：DSH
-- 分支：main（尚未建远端）
-- 开始时间：2026-10-02 19:30
+- 工具：（空 —— 2026-10-02 DSH 会话已收工：仓库公开 + npm 首发 + CI 两平台全绿）
+- 分支：main
+- 开始时间：—
 
 > 一个仓库同一时刻只允许一个写者。交接时把上一行改成自己，并先读完下面的状态。
 
 ## 当前状态
 
-**这个仓库还不存在公开副本** —— 它先在 DSH 会话工作区的 `.dev-backup-staging/dev-backup/`
-里搭好并通过测试，再整体搬到 `~/dev/dev-backup`、建远端、推上去。搬迁前的状态：
-
+**已公开发布**：[GitHub](https://github.com/haotian-lu-prog/dev-backup)（public，
+Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/package/dev-backup)
+（`dev-backup@1.0.0`，首发起始于本机 `npm publish`，registry shasum 与本地打包一致）。
+本机源码就在 `~/dev/dev-backup`；下面这些是它在本机验证过的状态：
 - `bin/dev-backup`（约 1500 行）已从私有的 `~/dev/_shared/bin/backup-dev.sh` 泛化完成：
   接口、退出码、JSON 契约、产物布局**逐字节保持兼容**；新增配置文件、
   `--config/--root/--dest/--logdir`、`--init`、`--version`、`schedule install|uninstall|status`，
@@ -65,28 +66,28 @@
 
 ## 下一步
 
-- [x] 收齐 `test/selftest.sh`，`npm test` 全绿；`/bin/bash test/selftest.sh`（3.2）也全绿
-- [x] 补 `README.en.md`
-- [ ] 整体搬到 `~/dev/dev-backup`（需要一次沙箱外的写权限批准），`git init` + 首次提交
-- [ ] `gh repo create haotian-lu-prog/dev-backup --public --source . --push`
-      （**Website 先留空**：还没发到 npm，公约禁止拿别的链接凑数）
-- [ ] 推上去后看 CI 是否两个平台都绿（尤其 ubuntu 上的 GNU 分支）
-- [ ] npm 首发 `dev-backup@1.0.0`；发完把 GitHub Website 回填成
-      `https://www.npmjs.com/package/dev-backup`
-- [ ] 本机切换：`_shared/bin/backup-dev.sh` 改成薄壳（`exec dev-backup --config ~/dev/_shared/backup-dev.conf "$@"`），
-      个人约定（`ROOT` / `DEST` / `CONFIGS` / `LOGDIR` / `NOTIFY_TITLE`）搬进那份配置文件。
-      **改完必须验证**：`git commit` 一次 → `$DEST/manifests/` 出现新 tsv、`--status` 退 0、
-      插件与面板仍能读到 JSON。
-- [ ] 顺手修私有仓库的已知隐患（见下）
+- [ ] **给 npm 配 trusted publishing**（下次发版走 GitHub Release → `publish.yml` → 带 provenance）。
+      首发是本机 `npm publish` 发的，没有 provenance；配法写在 `.github/workflows/publish.yml` 顶部注释里。
+- [ ] 用一段时间后，再评估要不要把**本机**冷备切到这个 CLI（本次用户明确决定保持现状，
+      接口与产物契约没变，切换成本已被压到一个 5 行薄壳）。
+- [ ] 若切换：`_shared/bin/backup-dev.sh` 换成 `exec dev-backup --config ~/dev/_shared/backup-dev.conf "$@"`，
+      个人约定（`ROOT`/`DEST`/`CONFIGS`/`LOGDIR`/`NOTIFY_TITLE`）搬进那份配置文件；改完必须验证
+      「`git commit` 一次 → `$DEST/manifests/` 出现新 tsv、`--status` 退 0、插件与面板仍能读到 JSON」。
+- [ ] 上游联动（可选）：`dsh-dev-backup` 插件 README 里 `statusJsonCommand` 的示例仍指向
+      `~/dev/_shared/bin/backup-dev.sh --status --json`；本机不切换的话它依然正确，不用改。
 
 ## 未决问题
 
-- **`_shared` 一侧的静默失效点**（搬迁时必须一起处理，否则会「提交照常、云盘再无新产物、零报警」）：
-  - `git-hooks/post-commit` 在脚本不可执行时**静默 exit 0**；
-  - `audit.sh` 把「备份脚本不存在」只算提醒（`rc` 仍 0），建议升级为 error；
-  - `app/main.swift` 与 `backup-selftest.sh` 各自硬编码脚本路径（前者可用 `DEV_BACKUP_SCRIPT` 注入）。
-- **`_shared/bin/backup-dev.sh:712`** 也有一处「变量后紧跟全角字符」（`$src）`），
-  只在「配置白名单里的目标缺少快照」这条路径上触发 —— 属于潜伏 bug，切到公开版后自然消失。
+- **`_shared` 的两个静默失效点已在 2026-10-02 修掉**（`_shared@697fef2`）：
+  `git-hooks/post-commit` 找不到脚本时不再静默 `exit 0`（改为每次提交打印警告，仍 exit 0）；
+  `audit.sh` 的「缺备份脚本」从提醒升级为错误。**两处都已实测**（缺脚本→有警告且 rc=0；
+  有脚本→后台照常触发；`DEV_BACKUP_DISABLE=1`→安静退出）。
+- **`_shared/bin/backup-dev.sh:712`** 有一处「变量后紧跟全角字符」（`$src）`），只在
+  「配置白名单里的目标缺少快照」这条路径触发 —— 潜伏 bug，公开版里已修，私有版仍在（未切换）。
+- **两实现并存的漂移风险**：本机跑私有脚本、公开版是另一份。契约面（JSON / 退出码 / 产物布局 /
+  `last-ok` / `last-failure`）已冻结，改任一侧都要同步另一侧 —— 这是「不切换」的已知代价，
+  记在 `_shared/docs/decisions.md`。
 - 私有仓库的 `_shared/app`（macOS 面板）**要不要也公开**？当前决定是只公开引擎；
   面板绑着签名身份与 TCC 授权，公开了别人也得自己签名。
-- Linux 真机验证：作者手上没有 Linux 环境，目前只有 CI 覆盖。
+- **bash 5 未实测**（本机只有 3.2，靠 lint 的 bash4 规则集 + 按构造兼容）；
+  **Linux 真机未手工验证**，只有 CI（`ubuntu-latest`）覆盖。
