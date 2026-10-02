@@ -112,6 +112,17 @@ else
   ok "--init --dry-run stderr 干净"
 fi
 if [ -e "$initconf" ]; then no "--init --dry-run 竟然写了文件"; rm -f "$initconf"; else ok "--init --dry-run 没写文件"; fi
+# 真机上踩到过：`--init --dry-run` 会在**真实**日志目录里建一个 `tmp/` —— 自测于是污染了
+# 用户的 ~/Library/Logs，也让「dry-run 无副作用」这句话不成立。用临时 LOGDIR 钉住它。
+probe_logdir="$ROOT/.lint-init-logdir-probe"
+rm -rf "$probe_logdir"
+COLD_BACKUP_LOGDIR="$probe_logdir" COLD_BACKUP_CONFIG="$tmpconf" \
+  "$BIN" --config "$initconf" --init --dry-run >/dev/null 2>&1
+if [ -e "$probe_logdir" ]; then
+  no "--init --dry-run 建了日志目录（dry-run 不该有任何副作用）"; rm -rf "$probe_logdir"
+else
+  ok "--init --dry-run 没建日志目录"
+fi
 
 hdr "7 未配置时的 JSON 必须合法（下游解析它，不能是半截）"
 json="$(COLD_BACKUP_CONFIG="$tmpconf" "$BIN" --status --json 2>/dev/null)"; rc=$?

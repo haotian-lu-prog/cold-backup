@@ -24,7 +24,7 @@
 
 ## 当前状态
 
-**2026-10-02 追加（六）：改名 —— CLI `dev-backup` → `cold-backup`（本轮，已本地验证）。**
+**2026-10-02 追加（六）：改名 —— CLI `dev-backup` → `cold-backup`（本轮，已发布）。**
 
 - 目录 `~/dev/dev-backup` → `~/dev/cold-backup`；可执行文件 `bin/dev-backup` → `bin/cold-backup`。
 - 一次性换掉的标识：环境变量 `COLD_BACKUP_*`、配置文件 `~/.config/cold-backup/config`、
@@ -33,7 +33,18 @@
   `# >>> cold-backup >>>`、launchd label 模板 `com.cold-backup.daily`、临时文件名前缀。
   **不留旧名兼容** —— 理由、代价与迁移命令见 `docs/decisions.md` 顶部与 `docs/compatibility.md` §7
   （旧标记在新版眼里等于「没标记」，按 `unowned` 处理，不会误删）。
-- 验证：`test/lint.sh` **38/38**、`test/selftest.sh` **211/211**、`test/frozen-clock.sh` **211/211**。
+- 验证：`test/lint.sh` **39/39**、`test/selftest.sh` **211/211**、`test/frozen-clock.sh` **211/211**。
+- **顺手修掉一个真问题**（改名后跑 lint 时撞见的）：`--init --dry-run` 会在**真实**日志目录里建一个
+  `tmp/` —— 与 `AGENTS.md`「自测只在临时目录里操作」的承诺矛盾，也让「dry-run 无副作用」不成立
+  （本机 `~/Library/Logs/cold-backup/tmp` 就是这么冒出来的）。修法：把 `init` 并进那条
+  「只读模式不建目录」的 `case`，并在 `test/lint.sh` 加一条断言（38 → **39** 项）钉住它。
+- 发布面（同一天完成）：
+  - GitHub 仓库改名 `dev-backup` → **`cold-backup`**（旧 URL 301 重定向已实测）；
+    Website 按公约回填成 <https://www.npmjs.com/package/cold-backup>。
+  - npm 新包 **`cold-backup@1.0.2`** 已发布（本机 `npm publish`，**无 provenance**）；
+    旧包 `dev-backup` 的 1.0.0 / 1.0.1 / 1.0.2 三个版本已 deprecate 并指向新名。
+  - 市场投稿换成 PR **#6410**（`data/plugins/haotian-lu-prog__dsh-cold-backup.yml`，+1 文件 / +6 行）；
+    旧的 #6322 因分支改名被 GitHub 自动关闭，已在上面留了说明。
 - 配对改动：DSH 插件 `dsh-dev-backup` → `dsh-cold-backup`（同一批次，见那个仓库）。
 
 **已公开发布**：[GitHub](https://github.com/haotian-lu-prog/dev-backup)（public，
@@ -136,6 +147,13 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
+- [ ] **（改名后新增，优先）新包名要各自再配一次 trusted publishing**：`cold-backup` 在 npm 上是
+      **新包**，而 trusted publisher 是**按包**配的 —— 旧名 `dev-backup` 那份配置对新名字不生效，
+      所以 CI 的 `publish.yml` 现在发不出去（`PUT` 404）。配法：npm → `cold-backup` →
+      Settings → Trusted Publisher → GitHub Actions，user `haotian-lu-prog` / repo `cold-backup` /
+      workflow `publish.yml` / Environment **留空**，并选 **allow publish**（不要选 stage publish）。
+      配好之前发版仍走本机 `npm publish`（无 provenance）—— `cold-backup@1.0.2` 就是这么发的。
+      插件侧同理（`dsh-cold-backup`），见那个仓库的 HANDOFF。
 - [ ] **trusted publishing 没匹配上，待查**（用户已在 npm 侧建过配置）：CI 的 `publish.yml` 跑到
       `npm publish` 那步报 `E404 PUT https://registry.npmjs.org/dev-backup`（npm 用 404 表示
       「不匹配 / 无权限」）。工作流本身与**已能成功发布**的 `dsh-dev-backup` 那份结构一致
