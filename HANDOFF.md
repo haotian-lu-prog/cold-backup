@@ -4,11 +4,18 @@
 
 ## 当前写者
 
-- 工具：（空 —— 2026-10-02 DSH 会话已收工：**改名 `dev-backup` → `cold-backup` 已完成并发布**；
-  新包名的 trusted publishing 待配）
+- 工具：DSH（**进行中，2026-10-03 11:30 +09:00 起**）
 - 分支：main
-- 开始时间：—
-- 本轮：**改名** —— 引擎 CLI `dev-backup` → **`cold-backup`**，与 DSH 插件
+- 开始时间：2026-10-03 11:30 (+09:00)
+- 本轮：两处小改（都由本机 2026-10-03 的冷备链路改造触发，**未发布**，版本号等你定）：
+  ① `--init` 模板里的 `FDA_APP` 默认值不再写死某个具体 app，改成「指向你自己那个跑本 CLI 的
+  app」，并写清原因（FDA 授权绑在 app 的 bundle id + 代码签名上，脚本因 shebang 拿不到）；
+  ② **修掉「仅大小写改名」导致的残留误报**：macOS 默认 APFS 不区分大小写，`snapshots/Scratch`
+  与 `snapshots/scratch` 是**同一个目录**；工作区目录只改大小写后，纯字符串比较把**活目录**
+  判成残留，而 `--prune-orphans --apply` 是 `rm -rf` —— 真机实测会删掉该目标的当前活快照
+  （连 `.cold-backup-owner` 一起）。判据改成 `-ef`（同一 inode）比目录，见 `same_as_known_dir()`；
+  自测新增 13b 节（macOS 验「同目录不算残留 + --apply 不许删」，Linux 验反向「真残留仍要报」）。
+- 上一轮：**改名** —— 引擎 CLI `dev-backup` → **`cold-backup`**，与 DSH 插件
   `dsh-dev-backup` → `dsh-cold-backup` 同步：包名、可执行文件 `bin/cold-backup`、
   环境变量前缀 `DEV_BACKUP_*` → `COLD_BACKUP_*`、默认目录 `~/Library/Logs/cold-backup`（Linux
   `~/.local/state/cold-backup`）、配置文件 `~/.config/cold-backup/config`、JSON 契约

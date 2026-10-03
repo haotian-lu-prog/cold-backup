@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cold-backup 端到端自测：在临时工作区里造 git 仓库与非 git 目录，把整条链路真跑一遍。
 #   备份 → 幂等 → 状态 → 校验 → 还原演练 → 落后检测 → KEEP 轮转 → 快照去重 → 损坏自愈 →
-#   失败信号 → stash → 配置白名单/密钥预检 → 残留清理 → JSON 契约 → 每日巡检 →
+#   失败信号 → stash → 配置白名单/密钥预检 → 残留清理（含仅大小写改名的活目录）→ JSON 契约 → 每日巡检 →
 #   配置优先级 → --init → 只读承诺 → 未配置 → 归属标记 → schedule → 版本 → 删除失败 → 平台项
 #
 # 隔离：全程只用 mktemp -d 造的临时目录；开头强制 COLD_BACKUP_CONFIG 指向不存在的路径
@@ -348,6 +348,46 @@ done
 [ -n "$(ls -1 "$COLD_BACKUP_DEST/repos/demo"/*.bundle 2>/dev/null)" ] && ok "真目标的产物仍在" || no "真目标的产物没了"
 [ -d "$COLD_BACKUP_DEST/configs/claude-config" ] && ok "真配置目标未被误删" || no "真配置目标被误删"
 "$BIN" --prune-orphans >/dev/null 2>&1; eq "清理后再跑一次仍退出 0（无残留）" "$?" "0"
+
+hdr "13b 只改大小写的工作区目录：活目录不算残留（大小写不敏感的卷）"
+# 背景：macOS 默认 APFS 不区分大小写，`snapshots/Scratch` 与 `snapshots/scratch` 是**同一个目录**。
+# 工作区目录只改大小写（`scratch` → `Scratch`）后标签变了、磁盘上的目录名没变，纯字符串比较会把
+# **活目录**判成残留 —— 而 `--apply` 是 `rm -rf`：真机实测会删掉该目标的当前活快照。
+# 判据用 `-ef`（同一 inode），所以在真正区分大小写的卷上（Linux 常见）两个名字仍是两个目录，
+# 那时这一节没有可复现的场景，明确跳过而不是假装通过。
+ci_fs=0
+mkdir -p "$COLD_BACKUP_DEST/snapshots/.case-probe" 2>/dev/null
+[ -d "$COLD_BACKUP_DEST/snapshots/.CASE-PROBE" ] && ci_fs=1
+rmdir "$COLD_BACKUP_DEST/snapshots/.case-probe" 2>/dev/null
+if [ "$ci_fs" != "1" ]; then
+  # 反向用例：在**区分大小写**的卷上（Linux 常见）`Scratch` 与 `scratch` 是两个目录，
+  # 前者是真残留，必须报出来。这条挡住「把两边整体折叠成小写再比」那种更粗暴的修法 ——
+  # 它在本节上半段也能通过，却会把真残留永久藏起来。
+  mkdir -p "$COLD_BACKUP_DEST/snapshots/Scratch"
+  js="$("$BIN" --status --json 2>/dev/null)"
+  contains "$(jline "$js" orphans)" 'Scratch' && ok "① 区分大小写的卷上：仅大小写不同的**真残留**仍被报出" \
+    || no "① 真残留被「折叠大小写」的判据藏起来了：$(jline "$js" orphans)"
+  rm -rf "$COLD_BACKUP_DEST/snapshots/Scratch"
+  "$BIN" --prune-orphans >/dev/null 2>&1; eq "② 清掉假残留后 dry-run 仍退出 0" "$?" "0"
+  ok "（本机文件系统区分大小写：两个名字本来就是两个目录，「同目录不算残留」的场景不可复现，已跳过）"
+else
+  [ -n "$(ls -1 "$COLD_BACKUP_DEST/snapshots/scratch"/*.tar.gz 2>/dev/null)" ] || run
+  # 只改大小写：一步 mv 在大小写不敏感的卷上会「原地不动」，所以过一手临时名
+  mv "$DEV_ROOT/scratch" "$DEV_ROOT/.scratch-case" && mv "$DEV_ROOT/.scratch-case" "$DEV_ROOT/Scratch"
+  if [ -d "$DEV_ROOT/Scratch" ]; then
+    js="$("$BIN" --status --json 2>/dev/null)"
+    orph="$(jline "$js" orphans)"
+    contains "$orph" '[]' && ok "大小写改名后不算残留" || no "大小写改名后活目录被当成残留：${orph}"
+    "$BIN" --prune-orphans --apply >/dev/null 2>&1
+    [ -d "$COLD_BACKUP_DEST/snapshots/scratch" ] && ok "--apply 没删掉活目录" || no "--apply 删掉了活目录（数据丢失）"
+    [ -n "$(ls -1 "$COLD_BACKUP_DEST/snapshots/scratch"/*.tar.gz 2>/dev/null)" ] && ok "活产物仍在" || no "活产物被删了"
+    [ -f "$COLD_BACKUP_DEST/snapshots/scratch/.cold-backup-owner" ] && ok "归属标记仍在" || no "归属标记被删了"
+    mv "$DEV_ROOT/Scratch" "$DEV_ROOT/.scratch-case" && mv "$DEV_ROOT/.scratch-case" "$DEV_ROOT/scratch"
+  else
+    no "夹具改名失败（${DEV_ROOT}/scratch → Scratch）"
+  fi
+  [ -d "$DEV_ROOT/scratch" ] && ok "夹具已复原（scratch 小写）" || no "夹具没复原"
+fi
 
 hdr "14 JSON 契约（cold-backup.status/1）：一次判定、两种渲染"
 "$BIN" --status --json >"$W/status.json" 2>"$W/status.err"

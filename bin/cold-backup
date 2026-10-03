@@ -1131,6 +1131,37 @@ run_status_json() {
   return "$S_RC"
 }
 
+# 候选目录与某个已知目标目录（或它的祖先目录）是**同一个目录**吗？
+#
+# 为什么不能只比名字：macOS 默认 APFS **不区分大小写**，`snapshots/Scratch` 与 `snapshots/scratch`
+# 是同一个目录。工作区目录只改大小写（`scratch` → `Scratch`）后标签变了、磁盘上的目录名没变，
+# 纯字符串比较就把**活目录**判成残留 —— 而 `--prune-orphans --apply` 是 `rm -rf`：真机实测，
+# 这一步会删掉该目标的当前活快照（连 `.cold-backup-owner` 一起）。
+#
+# 用 `-ef`（同一 inode）而不是「整体折叠大小写再比」：在**真正区分大小写**的卷上（Linux 常见），
+# `Foo` 与 `foo` 是两个不同目录，折叠会把真残留永久藏起来；`-ef` 只在两者确实指同一个目录时才跳过。
+# 祖先目录也要比：标签带 `/` 的目标（`plugins/foo`）在备份目录里是嵌套的，分组目录
+# （`repos/plugins`）只改大小写后同样会被误判 —— 而它下面装的全是活产物。
+same_as_known_dir() { # $1=已知目标清单「类型|标签」多行 $2=类型 $3=基目录 $4=候选相对路径
+  local known="$1" kind="$2" base="$3" rel="$4" k l probe
+  [ -n "$known" ] || return 1
+  while IFS='|' read -r k l; do
+    [ -n "$l" ] || continue
+    [ "$k" = "$kind" ] || continue
+    probe="$base/$l"
+    while :; do
+      [ "$DEST/$rel" -ef "$DEST/$probe" ] && return 0
+      case "$probe" in
+        */*) probe="${probe%/*}" ;;
+        *) break ;;
+      esac
+    done
+  done <<EOF
+$known
+EOF
+  return 1
+}
+
 # 备份目录里「已不对应任何目标」的目录（仓库改名/删除、配置白名单调整之后留下的）。
 # 输出相对 $DEST 的路径，例如 `repos/old-name`。状态与清理共用这一段，避免两处判据漂移。
 #
@@ -1168,6 +1199,8 @@ orphan_scan() { # $1=（可选）已知目标清单「类型|标签」多行；$
       label="${rel#"$base"/}"
       printf '%s\n' "$known" | grep -Fxq "${kind}|${label}" && continue   # 就是目标本身
       printf '%s\n' "$known" | grep -Fq "${kind}|${label}/" && continue   # 分组目录（下面是活目标）
+      # 名字对不上，但可能是**同一个目录的另一种写法**（大小写不敏感的卷）——见 same_as_known_dir
+      same_as_known_dir "$known" "$kind" "$base" "$rel" && continue
       cls="$(owner_class "$rel")"
       if [ "$want" = "foreign" ]; then
         [ "$cls" = "foreign" ] && printf '%s\n' "$rel"
