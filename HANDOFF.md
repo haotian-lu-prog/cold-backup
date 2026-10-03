@@ -4,10 +4,27 @@
 
 ## 当前写者
 
-- 工具：DSH（**进行中，2026-10-03 11:30 +09:00 起**）
+- 工具：DSH/子代理（**已收工，2026-10-03 22:15 → 22:35 +09:00**）
 - 分支：main
-- 开始时间：2026-10-03 11:30 (+09:00)
-- 本轮：两处小改（都由本机 2026-10-03 的冷备链路改造触发，**未发布**，版本号等你定）：
+- 开始时间：2026-10-03 22:15 (+09:00)
+- 本轮：**引擎侧进度契约**（接口已定案，只实现不改语义）：新增**可选**环境变量
+  `COLD_BACKUP_PROGRESS_FILE=<路径>` —— 设了就把本次运行的事件**追加**成 JSONL（一行一个 JSON），
+  供 GUI / 面板等读侧实时显示进度；不设＝**逐字节零变化**（不建文件、不动 stdout/stderr/退出码/
+  `last-ok`/manifest/产物布局）。事件：`plan(section=backup)` → 每个目标 `state=start/done`
+  → `plan(section=verify)` → 每份产物 `verify.done` → `{"phase":"status"}` → 收尾
+  `{"done":true,"exitCode":N,"ms":N}`（**无论成败都写**，挂在 `trap on_exit EXIT` 上）。
+  写进度失败只记一条日志并停用，绝不影响备份本身。
+  - 验证：`test/lint.sh` **39/39**、`test/selftest.sh` **256/256/0 跳过**（新增 13c 节 29 项断言）、
+    系统 `/bin/bash` 3.2 同 **256/256**、`test/frozen-clock.sh` **256/256**；变异测试五个方向
+    （去掉 `progress_target_end` / plan.total 偏 1 / `--status` 也装配进度 / label 不转义 /
+    不写收尾 done）→ 13c 分别稳定红 1、1、1、1、5 项。
+  - 契约文档：`docs/compatibility.md` **§4.1 可选的进度文件**（新增小节，未改动既有编号）；
+    决策：`docs/decisions.md` 顶部（为什么由引擎给、为什么必须可选、ms 只有秒精度的代价）；
+    README 中英各加一行（环境变量清单里，与 `COLD_BACKUP_DISABLE` 同类，只认环境变量、不进配置文件）。
+  - 两个**自由裁量点**（规格里没写死，已在 §4.1 写清）：① `--restore-drill` / `--prune-orphans`
+    没有那三个阶段，只写收尾那条 `done`（纯只读模式连文件都不建）；② 致命错误时正在处理的目标
+    可能只有 `start` 没有 `done`，但末行永远是收尾那条。见「未决问题」。
+- 上一轮：两处小改（都由本机 2026-10-03 的冷备链路改造触发，**未发布**，版本号等你定）：
   ① `--init` 模板里的 `FDA_APP` 默认值不再写死某个具体 app，改成「指向你自己那个跑本 CLI 的
   app」，并写清原因（FDA 授权绑在 app 的 bundle id + 代码签名上，脚本因 shebang 拿不到）；
   ② **修掉「仅大小写改名」导致的残留误报**：macOS 默认 APFS 不区分大小写，`snapshots/Scratch`
@@ -31,6 +48,33 @@
 > 一个仓库同一时刻只允许一个写者。交接时把上一行改成自己，并先读完下面的状态。
 
 ## 当前状态
+
+**2026-10-03 追加（八）：引擎侧进度契约（可选；未发布，版本号等定）。**
+
+- 缘起：读侧（DSH 插件 / macOS 面板）在一次运行**进行中**只能显示「在跑」——拿不到目标清单、
+  每个目标的开始/结束与失败原因，`--verify` 这种不写产物的阶段更是完全看不出来。stdout 不是契约
+  （[compatibility.md](docs/compatibility.md) §2），轮询 `DEST` 也猜不出来。
+- 做法：新增**可选**环境变量 `COLD_BACKUP_PROGRESS_FILE=<路径>`；设了才把事件**追加**成 JSONL
+  （一行一个 JSON 对象、一次追加写即关闭 → 读侧立刻可见、不会读到半行），顺序固定：
+  `plan(section=backup,total,units[weight])` → 每目标 `state=start` / `state=done`
+  （`result=stored|skipped|failed`、`ms`）→ `plan(section=verify,total,units)` → 每份产物
+  `verify.done/ok` → `{"phase":"status"}` → 收尾 `{"done":true,"exitCode","ms"}`
+  （挂在 `trap on_exit EXIT`，**成败都写**）。
+- **不设＝零变化**：不建文件、不写一行；自测里用 `cmp` 钉住「同一条命令，设与不设的 stdout
+  逐字节一致」。只读模式（`--status` / `--status --json` / `--version` / `--init` / `schedule …`）
+  连文件都不建（只读承诺不破）。
+- 写失败（路径是目录 / 只读 / 磁盘满）**只记一条日志并停用进度**，绝不影响备份与退出码 ——
+  进度是旁路信号，备份的价值在产物。
+- `ms` 是**秒级近似**（秒差 × 1000）：bash 3.2 没有毫秒时钟，也不许引 python3 / perl 依赖。
+- 实现位置：`bin/cold-backup` 的「引擎侧进度契约」一节（`progress_*` 函数、`progress_arm` 的分派
+  `case`、以及 `verify_units()` —— 它与 `run_verify` 主循环同口径，`plan.total` 与 `verify.done`
+  才不会漂移）；事件字段表见 [compatibility.md §4.1](docs/compatibility.md)。
+- 验证：`test/lint.sh` **39/39**、`test/selftest.sh` **256/256（0 跳过）**、系统 `/bin/bash` 3.2
+  同 **256/256**、`test/frozen-clock.sh` **256/256**；**变异测试**五个方向（去掉
+  `progress_target_end` / plan.total 偏 1 / `--status` 也装配进度 / label 不做 JSON 转义 /
+  不写收尾 done）13c 分别稳定红 1、1、1、1、5 项 —— 夹具里特意放了一个名字带 `"` 的目录
+  （`quo"te`），否则「不转义」那个变异抓不住。
+  另手工验证：`DEST` 父目录不存在时 `--daily` 立刻失败也写出 `done:true` + `exitCode:1`。
 
 **2026-10-02 追加（七）：修掉残留清理的「分组目录」误报，随 `1.0.3` 发布。**
 
@@ -172,6 +216,8 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 下一步
 
+- [ ] **进度契约已就绪、待发布**（2026-10-03 本轮）：只提交到**本地** `main` —— 未 push、
+  未 `npm publish`、**未改版本号**。发布前先看「未决问题」里那两个自由裁量点是否要改口径。
 - [x] ~~**`1.0.3` 已就绪，正在发布**~~ → **已发布（2026-10-02）**：`dist-tags.latest = 1.0.3`，
   registry `dist.shasum = bae4f119899d6ecbeae6b21832a0b2e8ffba4d44`。
   Release `v1.0.3` 已建（tag → `c69d044`），asset `cold-backup-1.0.3.tgz` 就是 **registry 那一份**
@@ -221,6 +267,13 @@ Website 已按公约回填成 npm 包页）与 [npm](https://www.npmjs.com/packa
 
 ## 未决问题
 
+- **进度契约的两个自由裁量点（发布前确认）**：① 规格里「`--status` 之类只读运行不产生任何事件
+  （也别创建文件）」与给的失败用例「`--prune-orphans` 指向不存在的 DEST 也要有 `done:true`」
+  只在「prune 算不算只读」上冲突。现在的取法：`backup|verify|daily|drill|prune-orphans` 装配进度
+  （后两个只写收尾那条 `done`），`status|version|init|schedule` 完全不碰文件；自测 ⑤ 用的就是
+  规格里那个 prune 用例。② 致命错误（`die` / `set -u` / 被 kill）时，正在处理的那个目标只有
+  `start` 没有 `done`（没有兜底的配对事件），末行仍是收尾 `done:true`。两条都写进了
+  compatibility.md §4.1；要改成「只读语义更严」或「补配对事件」，各是一处小改。
 - [x] ~~**⚠ 残留清理有误报，照着提示 `--prune-orphans --apply` 会删掉活的产物**~~ →
   **2026-10-02 当日已修**，随 `1.0.3` 发布。根因：`orphan_scan()` 只枚举 `$DEST/repos/*` 的
   **直接**子目录，把 `repos/plugins` 这种分组目录也当成标签去比对；而标签带 `/` 的目标

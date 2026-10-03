@@ -266,6 +266,11 @@ FDA_APP="$(cfg COLD_BACKUP_FDA_APP FDA_APP "" "")"
 CONFIGS_SPEC="$(cfg COLD_BACKUP_CONFIGS CONFIGS "" "off")"
 SCHED_LABEL="$(cfg COLD_BACKUP_LABEL LABEL "$SCHED_LABEL" "com.cold-backup.daily")"
 
+# 进度文件：**可选**，只认环境变量（与 COLD_BACKUP_DISABLE / COLD_BACKUP_DEEP_ALL 同类：
+# 它是给**读侧**（GUI / 面板 / 插件）用的旁路信号，不属于「怎么备份」的配置）。
+# 不设 = 一个字节都不写；设了才在运行开始时创建/清空并逐行追加。实现见下面「引擎侧进度契约」。
+PROGRESS_FILE="$(expand_path "${COLD_BACKUP_PROGRESS_FILE:-}")"
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG="$LOG_DIR/backup.log"
 LOCK="$LOG_DIR/.lock"
@@ -370,9 +375,180 @@ on_exit() {
     log "异常退出 rc=${rc}（没走到 die：可能是 set -u 中止或被信号杀死）"
     notify "异常退出 rc=${rc}（日志 ${LOG}）"
   fi
+  # 进度契约的收尾事件：成功失败都要写（进度停用/未装配时它是空操作）
+  progress_finish "$rc"
   return 0
 }
 trap on_exit EXIT
+
+# ── 引擎侧进度契约（可选；COLD_BACKUP_PROGRESS_FILE）──────────────────────────
+# 为什么由**引擎**给：进度必须由真正干活的那一层报出来 —— 读侧（GUI / 面板 / 插件）才知道这一轮
+# 有几个目标、每个目标何时开始、结果是什么。靠解析 stdout 拿不到（人读输出本来就不是契约，
+# 见 docs/compatibility.md §2），靠轮询备份目录更拿不到 start / failed / 当前阶段。
+#
+# 为什么是**可选**：这是**新增的**可选行为，只认一个环境变量。不设它 = 不建文件、不写一行、
+# 不改 stdout / stderr / 退出码 / last-ok / manifest / 产物布局 —— 既有消费者看到的与从前**逐字节
+# 一致**（所以按 docs/compatibility.md §5，它不算破坏性变更）。
+#
+# 为什么写失败绝不能影响备份：进度是**旁路信号**，不是备份的一部分 —— 备份的价值在产物。
+# 磁盘满、路径只读、云盘占位文件都会让追加失败；那时正确的反应是记一条日志并停用进度
+# （把 PROGRESS_FILE 清空），而不是让一次好好的备份失败或退出码变脏。
+#
+# 时间精度：不许引入依赖（没有 python3 / perl 可用），bash 3.2 下 `date` 只有秒精度，
+# 所以 ms = 秒差 × 1000，是**秒级近似值**，不是真实毫秒；拿不到就写 0。
+#
+# 事件（JSONL：一行一个 JSON 对象，每行独立可解析；每行一次追加写、写完即关闭，
+# 所以读侧立刻可见，也不会读到半行）：
+#   {"v":1,"phase":"plan","section":"backup","total":N,"units":[{"kind","label","weight"},…]}
+#   {"v":1,"phase":"backup","state":"start","kind":K,"label":L}
+#   {"v":1,"phase":"backup","state":"done","kind":K,"label":L,"result":"stored|skipped|failed","ms":M}
+#   {"v":1,"phase":"plan","section":"verify","total":N,"units":[…]}      # weight = 该份产物字节数
+#   {"v":1,"phase":"verify","done":i,"total":N,"label":L,"ok":true|false}
+#   {"v":1,"phase":"status"}
+#   {"v":1,"done":true,"exitCode":C,"ms":M}                              # 无论成败都写（on_exit 里）
+# units 与 total 是同口径的：units 的条数 == total（backup 一个目标一条，verify 一份产物一条）。
+PROGRESS_V=1
+PROGRESS_ARMED=0
+PROGRESS_T0=""
+PROGRESS_T0_TARGET=""
+PROGRESS_VERIFY_TOTAL=0
+PROGRESS_VERIFY_DONE=0
+P_RESULT="skipped"        # 当前目标的结果，由 backup_* 设置，progress_target_end 读取
+
+progress_now() { date +%s 2>/dev/null || printf '0'; }
+
+# 追加一行。任何失败都只记日志 + 停用；**永远返回 0**，绝不把调用方带下水。
+progress_emit() { # $1=整行 JSON
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  [ -n "$PROGRESS_FILE" ] || return 0
+  printf '%s\n' "$1" >>"$PROGRESS_FILE" 2>/dev/null && return 0
+  log "进度文件写入失败，本轮起停用进度输出（备份本身不受影响）：${PROGRESS_FILE}"
+  PROGRESS_FILE=""
+  return 0
+}
+
+# 运行开始：创建 / 清空（截断）进度文件，之后只追加。
+# 只读模式（--status / --status --json / --version / --init / schedule …）**根本不调它** ——
+# 「看一眼状态」不该在磁盘上留下足迹（同 AGENTS.md 的只读承诺）。
+progress_arm() {
+  [ -n "$PROGRESS_FILE" ] || return 0
+  PROGRESS_T0="$(progress_now)"
+  PROGRESS_ARMED=1
+  mkdir -p "$(dirname "$PROGRESS_FILE")" 2>/dev/null   # 父目录不存在就顺手建（失败也无妨）
+  if : >"$PROGRESS_FILE" 2>/dev/null; then return 0; fi
+  PROGRESS_ARMED=0
+  log "进度文件无法创建/清空，忽略进度输出（备份本身不受影响）：${PROGRESS_FILE}"
+  PROGRESS_FILE=""
+  return 0
+}
+
+# 收尾事件：**无论成功失败都要写**，所以挂在 on_exit 上（die / set -u 中止 / 被 kill 都走得到）。
+progress_finish() { # $1=进程退出码
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  local ms=0 now
+  now="$(progress_now)"
+  case "${PROGRESS_T0}" in
+    ''|*[!0-9]*) ;;
+    *) [ "$now" -ge "$PROGRESS_T0" ] && ms=$(( (now - PROGRESS_T0) * 1000 )) ;;
+  esac
+  case "${1:-1}" in ''|*[!0-9]*) set -- 1 ;; esac
+  progress_emit "$(printf '{"v":%s,"done":true,"exitCode":%s,"ms":%s}' "$PROGRESS_V" "$1" "$ms")"
+  return 0
+}
+
+progress_ms_since() { # $1=起始 epoch 秒 → 毫秒（秒级近似；拿不到写 0）
+  local now ms=0
+  now="$(progress_now)"
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '0'; return 0 ;;
+  esac
+  [ "$now" -ge "$1" ] && ms=$(( (now - $1) * 1000 ))
+  printf '%s' "$ms"
+}
+
+# 某个目标「最新产物」的字节数（未知 = 0）：plan 的 weight 用它，读侧可以据此估总进度。
+progress_target_weight() { # $1=kind $2=label
+  local f="" w
+  case "$1" in
+    repo)     f="$(newest_bundle "$DEST/repos/$2")" ;;
+    snapshot) f="$(newest_snapshot "$DEST/snapshots/$2")" ;;
+    config)   f="$(newest_snapshot "$DEST/configs/$2")" ;;
+  esac
+  [ -n "$f" ] || { printf '0'; return 0; }
+  w="$(file_size "$f" 2>/dev/null)"
+  case "$w" in ''|*[!0-9]*) w=0 ;; esac
+  printf '%s' "$w"
+}
+
+progress_plan_backup() { # 备份阶段开始前：目标清单（weight = 该目标最新产物字节数）
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  local kind label src n=0 units="" w
+  while IFS="$(printf '\t')" read -r kind label src; do
+    [ -n "${label:-}" ] || continue
+    n=$((n + 1))
+    w="$(progress_target_weight "$kind" "$label")"
+    units="${units}${units:+,}{\"kind\":$(json_escape "$kind"),\"label\":$(json_escape "$label"),\"weight\":${w}}"
+  done < <(list_targets)
+  progress_emit "$(printf '{"v":%s,"phase":"plan","section":"backup","total":%s,"units":[%s]}' "$PROGRESS_V" "$n" "$units")"
+  return 0
+}
+
+progress_target_start() { # $1=kind $2=label
+  P_RESULT="skipped"
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  PROGRESS_T0_TARGET="$(progress_now)"
+  progress_emit "$(printf '{"v":%s,"phase":"backup","state":"start","kind":%s,"label":%s}' \
+    "$PROGRESS_V" "$(json_escape "$1")" "$(json_escape "$2")")"
+  return 0
+}
+
+progress_target_end() { # $1=kind $2=label；结果取 backup_* 设的 P_RESULT
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  local ms
+  case "${P_RESULT:-skipped}" in stored|skipped|failed) ;; *) P_RESULT="skipped" ;; esac
+  ms="$(progress_ms_since "${PROGRESS_T0_TARGET}")"
+  progress_emit "$(printf '{"v":%s,"phase":"backup","state":"done","kind":%s,"label":%s,"result":"%s","ms":%s}' \
+    "$PROGRESS_V" "$(json_escape "$1")" "$(json_escape "$2")" "$P_RESULT" "$ms")"
+  return 0
+}
+
+progress_plan_verify() { # 校验阶段开始前：待校验产物清单（weight = 产物字节数）
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  local kind label w n=0 units=""
+  while IFS="$(printf '\t')" read -r kind label w; do
+    [ -n "${label:-}" ] || continue
+    n=$((n + 1))
+    case "${w:-}" in ''|*[!0-9]*) w=0 ;; esac
+    units="${units}${units:+,}{\"kind\":$(json_escape "$kind"),\"label\":$(json_escape "$label"),\"weight\":${w}}"
+  done < <(verify_units)
+  PROGRESS_VERIFY_TOTAL="$n"
+  PROGRESS_VERIFY_DONE=0
+  progress_emit "$(printf '{"v":%s,"phase":"plan","section":"verify","total":%s,"units":[%s]}' "$PROGRESS_V" "$n" "$units")"
+  return 0
+}
+
+progress_verify_step() { # $1=标签 $2=1 通过 / 0 不通过（每份产物一次，done 累计）
+  [ "$PROGRESS_ARMED" = "1" ] || return 0
+  PROGRESS_VERIFY_DONE=$((PROGRESS_VERIFY_DONE + 1))
+  local ok=false
+  [ "$2" = "1" ] && ok=true
+  progress_emit "$(printf '{"v":%s,"phase":"verify","done":%s,"total":%s,"label":%s,"ok":%s}' \
+    "$PROGRESS_V" "$PROGRESS_VERIFY_DONE" "$PROGRESS_VERIFY_TOTAL" "$(json_escape "$1")" "$ok")"
+  return 0
+}
+
+progress_status_phase() { # 进入状态检查阶段（只有 --daily 会走到）
+  progress_emit "$(printf '{"v":%s,"phase":"status"}' "$PROGRESS_V")"
+  return 0
+}
+
+# 哪些模式装配进度：**会干活**的那些。纯只读模式（--status / --status --json / --version /
+# --init / schedule …）一个字节都不写，也不建文件。
+# --restore-drill / --prune-orphans 没有上面那三个阶段，只写收尾那条 done（长耗时、有终点，
+# 读侧照样需要「跑完了 / 退出码多少」这个信号）。
+case "$MODE" in
+  backup|verify|daily|drill|prune-orphans) progress_arm ;;
+esac
 
 acquire_lock() {
   local waited=0 now lts
@@ -515,7 +691,9 @@ backup_repo() { # $1=仓库路径 $2=标签
   short="${sha:0:12}"
   slug="$(printf '%s' "$label" | tr '/' '_')"
   d="$DEST/repos/$label"
-  owner_guard "repos/$label" "$label" || return 0
+  # 进度契约：结果 token 由这几个 backup_* 设置（stored / skipped / failed），
+  # 默认 skipped（函数开头不动它就等于「这个目标没产出新产物」）。
+  owner_guard "repos/$label" "$label" || { P_RESULT="failed"; return 0; }
   mkdir -p "$d" || die "无法创建 ${d}"
   owner_mark "$d"
   # 自愈：**扫描全部**匹配该提交的产物，而不是只看第一个。
@@ -553,6 +731,7 @@ backup_repo() { # $1=仓库路径 $2=标签
   bytes="$(file_size "$tmpf")"; [ -n "$bytes" ] || bytes=0
   final="$slug-$STAMP-$short.bundle"
   cp -f "$tmpf" "$d/.$final.partial" && mv -f "$d/.$final.partial" "$d/$final" || die "写入失败：${final}"
+  P_RESULT="stored"
   rm -f "$tmpf"
   sum="$(sha256_file "$d/$final")"
   printf '%s\n' "$sum" >"$d/$final.sha256"
@@ -579,7 +758,7 @@ backup_snapshot() { # $1=顶层目录名
   local label="$1" dir="$DEV_ROOT/$1" d final sum fp bytes tmpf newest
   [ -d "$dir" ] || return 0
   d="$DEST/snapshots/$label"
-  owner_guard "snapshots/$label" "$label" || return 0
+  owner_guard "snapshots/$label" "$label" || { P_RESULT="failed"; return 0; }
   mkdir -p "$d" || die "无法创建 ${d}"
   owner_mark "$d"
   local -a ex=()
@@ -608,6 +787,7 @@ store_snapshot_file() { # $1=标签 $2=目标目录 $3=临时 tar.gz $4=类型�
   fi
   final="$label-$STAMP-$fp.tar.gz"
   cp -f "$tmpf" "$d/.$final.partial" && mv -f "$d/.$final.partial" "$d/$final" || { rm -f "$tmpf"; die "写入失败：${final}"; }
+  P_RESULT="stored"
   rm -f "$tmpf"
   bytes="$(file_size "$d/$final")"; [ -n "$bytes" ] || bytes=0
   run_manifest_add "$(printf '%s\t%s\t%s\t-\t-\t%s\t%s\t%s' "$(date +%s)" "$kind" "$label" "$final" "$bytes" "$sum")"
@@ -661,13 +841,14 @@ backup_config() { # $1=标签 $2=家目录 $3=逗号分隔的相对路径
   IFS="$oldifs"
   if [ "${#items[@]}" -eq 0 ]; then log "跳过 ${label}：白名单里的条目都不存在"; return 0; fi
   d="$DEST/configs/$label"
-  owner_guard "configs/$label" "$label" || return 0
+  owner_guard "configs/$label" "$label" || { P_RESULT="failed"; return 0; }
   mkdir -p "$d" || die "无法创建 ${d}"
   owner_mark "$d"
   if ! config_secret_scan "$home" "${items[@]}" >>"$LOG" 2>&1; then
     log "跳过 ${label}：白名单文件里有疑似密钥（不加密上云，先拦住；明细见上几行）"
     out "  ✗ ${label}：检测到疑似密钥，已跳过（明细见日志）"
     SOFT_FAIL=1
+    P_RESULT="failed"   # 整轮会以退出码 1 收场，进度里如实报 failed（而不是「跳过了，没事」）
     return 0
   fi
   tmpf="$TMP/$label-$STAMP.tar.gz"
@@ -765,10 +946,14 @@ run_backup() {
   : >"$RUN_MANIFEST" 2>/dev/null
   find "$TMP" -maxdepth 1 -mmin +60 \( -name '*.bundle' -o -name '*.tar.gz' \) -delete 2>/dev/null
   log "开始备份：trigger=$TRIGGER dest=$DEST"
+  # 进度契约：备份阶段开始前先报目标清单（未装配进度时这两行都是空操作）
+  progress_plan_backup
   local n=0 r l t
   while IFS="$(printf '\t')" read -r r l; do
     [ -n "${r:-}" ] || continue
+    progress_target_start repo "$l"
     backup_repo "$r" "$l"
+    progress_target_end repo "$l"
     n=$((n + 1))
   done < <(list_repos)
   # 非仓库的顶层目录打快照（跳过隐藏目录；是仓库的话 .git 由 bundle 负责，含 worktree 的 .git 文件）
@@ -778,14 +963,18 @@ run_backup() {
       case "$t" in .*) continue ;; esac
       [ -d "$DEV_ROOT/$t" ] || continue
       is_git_repo "$DEV_ROOT/$t" && continue
+      progress_target_start snapshot "$t"
       backup_snapshot "$t"
+      progress_target_end snapshot "$t"
     done < <(ls -1 "$DEV_ROOT" 2>/dev/null)
   fi
   # 工具配置：改动不产生提交，所以靠每日任务与手动跑兜住
   local clabel chome citems
   while IFS='|' read -r clabel chome citems; do
     [ -n "${clabel:-}" ] || continue
+    progress_target_start config "$clabel"
     backup_config "$clabel" "$chome" "$citems"
+    progress_target_end config "$clabel"
   done < <(config_spec)
   # 本次新增了什么 → 写成 manifests/<时间戳>-<触发源>.tsv（新文件，不改任何已有文件）
   if [ -s "$RUN_MANIFEST" ]; then
@@ -1273,9 +1462,45 @@ deep_verify_bundle() { # $1=bundle：真校验——镜像 clone 到临时目录
   return 0
 }
 
+# 待校验产物枚举：输出「kind<TAB>label<TAB>字节数」，一行一份产物。
+# **它必须与 run_verify 主循环的枚举口径一致**（同一组 list_targets、同样的「先用 head/newest
+# 探一次，探不到就整段跳过」、snapshot|config 两个目录都收）—— 它是 plan.total / units 的来源，
+# 而 verify.done 由主循环逐份累加，两边一旦漂移，读侧的进度条就永远走不满。
+verify_units() {
+  local kind label src b f w
+  while IFS="$(printf '\t')" read -r kind label src; do
+    [ -n "${label:-}" ] || continue
+    case "$kind" in
+      repo)
+        b="$(head_bundle_of "$src" "$label")"
+        [ -n "$b" ] || b="$(newest_bundle "$DEST/repos/$label")"
+        [ -n "$b" ] || continue
+        for f in "$DEST/repos/$label"/*.bundle; do
+          [ -f "$f" ] || continue
+          w="$(file_size "$f" 2>/dev/null)"; case "${w:-}" in ''|*[!0-9]*) w=0 ;; esac
+          printf 'repo\t%s\t%s\n' "$label" "$w"
+        done
+        ;;
+      snapshot|config)
+        if [ "$kind" = "snapshot" ]; then b="$(newest_snapshot "$DEST/snapshots/$label")"; else b="$(newest_snapshot "$DEST/configs/$label")"; fi
+        [ -n "$b" ] || continue
+        for f in "$DEST/snapshots/$label"/*.tar.gz "$DEST/configs/$label"/*.tar.gz; do
+          [ -f "$f" ] || continue
+          w="$(file_size "$f" 2>/dev/null)"; case "${w:-}" in ''|*[!0-9]*) w=0 ;; esac
+          printf '%s\t%s\t%s\n' "$kind" "$label" "$w"
+        done
+        ;;
+    esac
+  done < <(list_targets)
+}
+
 run_verify() {
   require_dest
   need_git
+  # 进度契约：校验阶段开始前先报「待校验产物」清单与总数。
+  # ⚠️ 这里的枚举口径必须与下面那个主循环**逐条对齐**（哪些目标、哪些文件会被真校验），
+  # 否则 plan.total 与 verify.done 就对不上 —— 自测 13c 节用「done 最终必须等于 total」钉住它。
+  progress_plan_verify
   local rc=0 kind label src b f n side_bad
   out "== 校验产物完整性（逐份；bundle 会真 clone 一次）"
   if [ ! -d "$DEST" ]; then out "  ✗ 备份目录不存在：${DEST}"; return 1; fi
@@ -1305,17 +1530,22 @@ run_verify() {
             if deep_verify_bundle "$f"; then
               [ "$side_bad" -eq 1 ] && out "  ! $(basename "$f")：.sha256 缺失或不符，但内容可还原" \
                                     || out "  ✓ $(basename "$f")：可完整 clone（fsck 通过）"
+              progress_verify_step "$label" 1
             else
               out "  ✗ $(basename "$f")：无法 clone（文件已损坏）"; rc=1
+              progress_verify_step "$label" 0
               if [ "$FIX" = "1" ]; then rm -f "$f" "$f.sha256"; log "--fix 删除损坏产物 $(basename "$f")"; out "     已删除（重跑备份会重建最新那份）"; fi
             fi
           else
             if [ "$side_bad" -eq 1 ]; then
               out "  ! $(basename "$f")：.sha256 缺失或不符"; rc=1
+              progress_verify_step "$label" 0
             elif verify_bundle "$f" >/dev/null 2>&1; then
               out "  ✓ $(basename "$f")：结构完整"
+              progress_verify_step "$label" 1
             else
               out "  ✗ $(basename "$f")：git bundle verify 失败"; rc=1
+              progress_verify_step "$label" 0
               [ "$FIX" = "1" ] && { rm -f "$f" "$f.sha256"; out "     已删除"; }
             fi
           fi
@@ -1328,8 +1558,10 @@ run_verify() {
           [ -f "$f" ] || continue
           if gzip -t "$f" >/dev/null 2>&1 && tar -tzf "$f" >/dev/null 2>&1; then
             out "  ✓ $(basename "$f")：可完整解压"
+            progress_verify_step "$label" 1
           else
             out "  ✗ $(basename "$f")：损坏"; rc=1
+            progress_verify_step "$label" 0
             if [ "$FIX" = "1" ]; then rm -f "$f"; log "--fix 删除损坏快照 $(basename "$f")"; out "     已删除（重跑备份会重建）"; fi
           fi
         done
@@ -1402,6 +1634,8 @@ run_daily() {
   out "== 每日巡检（$(date '+%Y-%m-%d %H:%M')）"
   run_backup || rc=1                 # 备份失败会走 die（通知 + 退出 1）
   out ""; run_verify || { rc=1; out "  ✗ 产物校验未通过"; }
+  # 进度契约：进入状态检查阶段（只有 --daily 会有这条）
+  progress_status_phase
   out ""; run_status || { rc=1; out "  ✗ 状态检查未通过"; }
   if [ "$rc" -ne 0 ]; then
     log "每日巡检未通过 rc=${rc}"

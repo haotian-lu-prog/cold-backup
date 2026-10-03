@@ -99,6 +99,11 @@ Precedence: **flags > environment > config file > defaults**. The config file is
 | `WORKSPACE_ID` | `COLD_BACKUP_WORKSPACE_ID` | host + ROOT fingerprint | ownership marker (see below) |
 
 `COLD_BACKUP_DISABLE=1` makes backup mode exit 0 immediately (git hooks use it as a kill switch).
+`COLD_BACKUP_PROGRESS_FILE=<path>` makes the engine **append** this run's events as JSONL (for a
+progress bar / dashboard: `plan` → per-target `start`/`done` → per-artifact verify → a closing
+`done:true` with the exit code and elapsed time). It is an optional side channel for readers:
+**unset means not a single byte is written**, read-only modes don't even create the file, and a
+write failure only logs and never breaks the backup. Field table: [docs/compatibility.md](docs/compatibility.md) §4.1.
 
 ## Restore
 

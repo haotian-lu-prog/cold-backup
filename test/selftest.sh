@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # cold-backup 端到端自测：在临时工作区里造 git 仓库与非 git 目录，把整条链路真跑一遍。
 #   备份 → 幂等 → 状态 → 校验 → 还原演练 → 落后检测 → KEEP 轮转 → 快照去重 → 损坏自愈 →
-#   失败信号 → stash → 配置白名单/密钥预检 → 残留清理（含仅大小写改名的活目录）→ JSON 契约 → 每日巡检 →
+#   失败信号 → stash → 配置白名单/密钥预检 → 残留清理（含仅大小写改名的活目录）→
+#   进度契约（可选 JSONL）→ JSON 契约 → 每日巡检 →
 #   配置优先级 → --init → 只读承诺 → 未配置 → 归属标记 → schedule → 版本 → 删除失败 → 平台项
 #
 # 隔离：全程只用 mktemp -d 造的临时目录；开头强制 COLD_BACKUP_CONFIG 指向不存在的路径
@@ -388,6 +389,138 @@ else
   fi
   [ -d "$DEV_ROOT/scratch" ] && ok "夹具已复原（scratch 小写）" || no "夹具没复原"
 fi
+
+hdr "13c 进度契约（COLD_BACKUP_PROGRESS_FILE：可选，不设＝零变化）"
+# 读侧（GUI / 面板 / 插件）要在一次 --daily 的过程中显示进度：stdout 不是契约
+# （compatibility.md §2），轮询备份目录也拿不到 start / failed / 当前阶段 —— 所以由**引擎**
+# 把事件写成 JSONL（只追加、一行一个 JSON、写完即关闭 → 立刻可见）。本节守三件事：
+#   ① 不设环境变量时**一个字节都不写**，连文件都不建；
+#   ② 设了它跑一次完整 --daily：事件齐全、每行都是合法 JSON、plan.total 与目标数/产物数对得上、
+#      每个 state=done 的 label 都在 plan.units 里、verify.done 单调递增且最终等于 total、
+#      末行是 done:true 且 exitCode 与进程退出码一致；
+#   ③ **失败**的运行（退出码非 0）也要有末行 done:true。
+unset COLD_BACKUP_PROGRESS_FILE          # 调用方环境里若恰好设了它，别污染本节判定
+pw="$W/prog-ws"; pd="$W/prog-dest"; pl="$W/prog-logs"; pp="$W/prog/events.jsonl"
+mkdir -p "$pw/prog-repo" "$pw/prog-dir" "$pw/quo\"te" "$W/prog"
+( cd "$pw/prog-repo" && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'a\n' >a.txt && git add -A && git commit -qm init ) >/dev/null 2>&1
+printf 'notes\n' >"$pw/prog-dir/n.txt"
+# 第三个目标的名字里带一个双引号：label 直接进 JSON，转义写错就会让整行解析失败
+# （变异测试里「不转义 label」正是靠它才变红的）。
+printf 'quote\n' >"$pw/quo\"te/n.txt"
+prun() { COLD_BACKUP_CONFIG="$W/no-such-config" COLD_BACKUP_CONFIGS=off COLD_BACKUP_NO_NOTIFY=1 \
+  "$BIN" --root "$pw" --dest "$pd" --logdir "$pl" "$@"; }
+prun_pf() { # $1=进度文件路径，其余透传（export/unset 让「设了/没设」是确定的）
+  local f="$1" rc; shift
+  export COLD_BACKUP_PROGRESS_FILE="$f"
+  prun "$@"; rc=$?
+  unset COLD_BACKUP_PROGRESS_FILE
+  return "$rc"
+}
+jsonl_n() { find "$pd" "$pl" -name '*.jsonl' 2>/dev/null | wc -l | tr -d ' '; }
+
+# ① 不设变量：不建任何进度文件
+prun --trigger=selftest >/dev/null 2>&1; eq "① 不设变量时备份退出码" "$?" "0"
+[ -e "$pp" ] && no "① 不设 COLD_BACKUP_PROGRESS_FILE 却出现了进度文件" || ok "① 不设变量：没有进度文件"
+eq "① 产物与日志目录里没有 JSONL 文件" "$(jsonl_n)" "0"
+
+# ② 完整 --daily（备份 + 校验 + 状态）：三个阶段与收尾都要在
+prun_pf "$pp" --daily >/dev/null 2>&1; drc=$?
+eq "② --daily（设了进度文件）退出码" "$drc" "0"
+[ -f "$pp" ] && ok "② 进度文件已生成" || no "② 没生成进度文件"
+eq "② 首行是 backup 的 plan" "$(head -1 "$pp" | grep -c '"phase":"plan","section":"backup"')" "1"
+eq "② 每行都以 { 开头（一行一个 JSON 对象）" "$(grep -c '^{' "$pp")" "$(wc -l <"$pp" | tr -d ' ')"
+eq "② 末行是 done:true" "$(tail -1 "$pp" | grep -c '"done":true')" "1"
+contains "$(tail -1 "$pp")" "\"exitCode\":${drc}" \
+  && ok "② 末行 exitCode 与进程退出码一致（${drc}）" || no "② 末行 exitCode 对不上：$(tail -1 "$pp")"
+grep -q '"phase":"status"' "$pp" && ok "② --daily 有 status 阶段事件" || no "② 缺 status 阶段事件"
+grep -q '"section":"verify"' "$pp" && ok "② --daily 有 verify 的 plan" || no "② 缺 verify 的 plan"
+eq "② status 阶段事件只出现一次" "$(grep -c '"phase":"status"' "$pp")" "1"
+grep -q 'quo\\"te' "$pp" && ok "② label 里的双引号被正确转义（不是裸引号）" \
+  || no "② label 没转义：$(grep -m1 'quo' "$pp")"
+
+if have python3; then
+  if python3 - "$pp" 3 <<'PY'
+import json, sys
+path, expect_total = sys.argv[1], int(sys.argv[2])
+ev = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+assert ev, "进度文件是空的"
+assert all(isinstance(e, dict) and e.get("v") == 1 for e in ev), "每行都必须是 v=1 的 JSON 对象"
+plans = [e for e in ev if e.get("phase") == "plan"]
+assert len(plans) == 2, ("--daily 应有 backup / verify 两个 plan", plans)
+bp, vp = plans
+assert bp.get("section") == "backup" and vp.get("section") == "verify", (bp, vp)
+# 目标数：本夹具 = 1 个仓库 + 2 个非 git 顶层目录（其中一个名字里带双引号）
+assert bp["total"] == expect_total == len(bp["units"]), (bp["total"], expect_total, len(bp["units"]))
+kinds = ("repo", "snapshot", "config")
+for u in bp["units"] + vp["units"]:
+    assert set(u) == {"kind", "label", "weight"}, u
+    assert u["kind"] in kinds and isinstance(u["label"], str) and u["label"], u
+    assert isinstance(u["weight"], int) and u["weight"] >= 0, u
+starts = [e for e in ev if e.get("state") == "start"]
+dones = [e for e in ev if e.get("state") == "done"]
+assert len(starts) == len(dones) == bp["total"], (len(starts), len(dones), bp["total"])
+bp_labels = [u["label"] for u in bp["units"]]
+for e in starts + dones:
+    assert e.get("phase") == "backup" and e["kind"] in kinds, e
+    assert e["label"] in bp_labels, ("done/start 的 label 不在 plan.units 里", e)
+assert [(e["kind"], e["label"]) for e in starts] == [(e["kind"], e["label"]) for e in dones], "start/done 不成对"
+for e in dones:
+    assert e["result"] in ("stored", "skipped", "failed"), e
+    assert isinstance(e["ms"], int) and e["ms"] >= 0, e
+# 校验阶段：每份产物一条，done 是 1..total，且最终等于 total
+vs = [e for e in ev if e.get("phase") == "verify"]
+assert vp["total"] == len(vp["units"]) and vp["total"] > 0, vp
+assert len(vs) == vp["total"], ("verify 事件条数 != plan.total", len(vs), vp["total"])
+assert [e["done"] for e in vs] == list(range(1, vp["total"] + 1)), "verify.done 必须 1..total 单调递增"
+assert all(e["total"] == vp["total"] and isinstance(e["ok"], bool) for e in vs), vs
+assert all(u["weight"] > 0 for u in vp["units"]), ("产物字节数应 > 0", vp["units"])
+last = ev[-1]
+assert last.get("done") is True, last
+assert isinstance(last["exitCode"], int) and isinstance(last["ms"], int), last
+assert sum(1 for e in ev if e.get("done") is True) == 1, "收尾事件只能有一条"
+PY
+  then
+    ok "② 逐行合法 JSON 且字段自洽（total/units/start-done 配对/verify 递增/done 收尾）"
+  else
+    no "② 进度文件不自洽（见上）"
+  fi
+else
+  skip "② 进度文件逐行 JSON 解析与字段自洽（没有 python3）"
+fi
+
+# ③ 单独 --verify：只有 verify 事件（没有 backup / status 阶段）
+prun_pf "$pp" --verify >/dev/null 2>&1; eq "③ 单独 --verify 退出码" "$?" "0"
+eq "③ 没有 backup 事件" "$(grep -c '"phase":"backup"' "$pp")" "0"
+eq "③ 没有 status 事件" "$(grep -c '"phase":"status"' "$pp")" "0"
+eq "③ verify 的 plan 只有一份" "$(grep -c '"section":"verify"' "$pp")" "1"
+
+# ④ 只读运行（--status）不产生任何事件，也不建文件
+rm -f "$pp"
+prun_pf "$pp" --status >/dev/null 2>&1
+[ -e "$pp" ] && no "④ --status（只读）竟然建了进度文件" || ok "④ --status 不建进度文件、不写事件"
+eq "④ 只读运行后产物与日志里仍没有 JSONL" "$(jsonl_n)" "0"
+
+# ⑤ 失败场景：DEST 不存在时 --prune-orphans 退出 1，但收尾那条 done:true 必须写出来
+pbad="$W/prog/bad.jsonl"; rm -f "$pbad"
+prun_pf "$pbad" --dest "$W/no-such-dest" --prune-orphans >/dev/null 2>&1; brc=$?
+eq "⑤ 失败场景退出码（DEST 不存在）" "$brc" "1"
+[ -f "$pbad" ] && ok "⑤ 失败的运行也写出了进度文件" || no "⑤ 失败时没写进度文件"
+eq "⑤ 末行是 done:true" "$(tail -1 "$pbad" | grep -c '"done":true')" "1"
+contains "$(tail -1 "$pbad")" "\"exitCode\":${brc}" \
+  && ok "⑤ 失败场景 exitCode 与退出码一致（${brc}）" || no "⑤ 失败场景 exitCode 对不上：$(tail -1 "$pbad")"
+
+# ⑥ 零变化：同一条命令、同一状态，设与不设的 stdout / 退出码逐字节一致
+rm -f "$pp"
+prun --trigger=selftest >"$W/prog-out-unset" 2>&1; rcu=$?
+[ -e "$pp" ] && no "⑥ 不设变量却又建了进度文件（同一路径）" || ok "⑥ 不设变量：跑完仍没有该文件"
+prun_pf "$pp" --trigger=selftest >"$W/prog-out-set" 2>&1; rcs=$?
+eq "⑥ 设与不设的退出码一致" "$rcs" "$rcu"
+cmp -s "$W/prog-out-unset" "$W/prog-out-set" && ok "⑥ 设与不设的 stdout 逐字节一致" \
+  || no "⑥ 设了进度文件却改变了 stdout：$(diff "$W/prog-out-unset" "$W/prog-out-set" 2>/dev/null | head -3)"
+[ -f "$pp" ] && ok "⑥ 设了变量才有文件（同一路径）" || no "⑥ 设了变量却没生成文件"
+rm -f "$pp"; prun --trigger=selftest >/dev/null 2>&1
+[ -e "$pp" ] && no "⑥ 去掉变量后的运行又建了进度文件" || ok "⑥ 去掉变量后不再创建该文件"
 
 hdr "14 JSON 契约（cold-backup.status/1）：一次判定、两种渲染"
 "$BIN" --status --json >"$W/status.json" 2>"$W/status.err"

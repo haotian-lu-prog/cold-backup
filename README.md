@@ -95,7 +95,11 @@ cold-backup schedule install       # 5) 装每日任务（macOS: launchd；其�
 | `FDA_APP` | `COLD_BACKUP_FDA_APP` | 自动探测 | macOS 上提示授权时指给用户看的 app |
 
 `COLD_BACKUP_DISABLE=1` 会让备份模式立刻退出 0（git 钩子用它做开关）；
-`COLD_BACKUP_DEEP_ALL=1` 让 `--verify` 对所有历史产物都做真 clone（慢，默认只对最新那份做）。
+`COLD_BACKUP_DEEP_ALL=1` 让 `--verify` 对所有历史产物都做真 clone（慢，默认只对最新那份做）；
+`COLD_BACKUP_PROGRESS_FILE=<路径>` 让引擎把本轮事件**追加**成 JSONL（进度条 / 看板用：
+`plan` → 逐目标 `start`/`done` → 逐份产物校验 → 收尾 `done:true` + 退出码 + 耗时）。
+它是给读侧的可选旁路信号：**不设就一个字节都不写**，只读模式连文件都不建；
+写入失败只记日志、不影响备份。字段表见 [docs/compatibility.md](docs/compatibility.md) §4.1。
 
 ### 工具配置白名单
 
