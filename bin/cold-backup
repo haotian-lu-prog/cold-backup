@@ -1613,8 +1613,11 @@ DEST=~/Backup/cold-backup
 # --restore-drill 的输出目录（默认落在日志目录的 tmp/ 下）
 # DRILL_DIR=~/dev/_lab
 
-# --status 在 macOS 上提示 FDA 授权时，指给用户看的那个 app
-# FDA_APP=~/Applications/Backup.app
+# --status 在 macOS 上提示 FDA 授权时，指给用户看的那个 app ——
+# 填**你自己那个跑本 CLI 的 app**（launchd 任务要读 ~/Library/CloudStorage 就得有完全磁盘
+# 访问权限，而该授权绑在 app 的 bundle id + 代码签名上；脚本因 shebang 换成 /bin/bash，拿不到）
+# 留空：退而显示 ~/Applications 下的第一个 app
+# FDA_APP=~/Applications/MyBackupRunner.app
 
 # 定时任务的 label（仅 macOS launchd）
 # LABEL=com.cold-backup.daily
